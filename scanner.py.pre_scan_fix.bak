@@ -24,7 +24,6 @@ import time
 from typing import Any
 
 import paramiko
-import database as db
 
 from database import (
     add_scan_result,
@@ -234,25 +233,14 @@ def tcp_open(ip: str, port: int, timeout: float = 1.0) -> bool:
 
 def precheck(ip: str, city: dict[str, Any]) -> list[str]:
     reasons=[]
-    # SNMP is UDP. Do not TCP-probe port 161: a valid SNMP-only device
-    # would otherwise be incorrectly classified as "not_alive".
-    # IMPORTANT: never probe/use RouterOS API SSL 8729.
-    if int(city.get("api_enabled", 1)) and int(city.get("api_ssl_enabled", 0)) == 0 and tcp_open(ip, city["api_port"]):
-        reasons.append(f"API {city['api_port']}")
-    if tcp_open(ip, city["ssh_port"]):
-        reasons.append("SSH")
+    if tcp_open(ip, city["snmp_port"]): reasons.append("SNMP")
+    # IMPORTANT: never probe/use 8729.
+    if int(city.get("api_enabled", 1)) and int(city.get("api_ssl_enabled", 0)) == 0 and tcp_open(ip, city["api_port"]): reasons.append(f"API {city['api_port']}")
+    if tcp_open(ip, city["ssh_port"]): reasons.append("SSH")
     try:
         rc=subprocess.run(["ping","-c","1","-W","1",ip],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=2).returncode
         if rc==0: reasons.append("ICMP")
-    except Exception:
-        pass
-    if not reasons:
-        # Only do a direct SNMP UDP check when the faster probes found
-        # nothing. This preserves scan speed on large networks while still
-        # discovering SNMP-only devices.
-        probe,_=snmp_get(ip,city,[STANDARD_OIDS["sysObjectID"]])
-        if probe:
-            reasons.append("SNMP")
+    except Exception: pass
     return reasons
 
 
@@ -270,15 +258,6 @@ def parse_equal_lines(text: str) -> dict[str, str]:
         for m in re.finditer(r'([A-Za-z][A-Za-z0-9_.-]*)\s*=\s*(?:"([^"]*)"|([^\s]+))',line):
             out[m.group(1).lower()]=m.group(2) if m.group(2) is not None else m.group(3)
     return out
-
-def routeros_interface_names(text: str) -> list[str]:
-    """Extract interface names from RouterOS print detail/terse output."""
-    names = []
-    for m in re.finditer(r'(?:^|\s)name=(?:"([^"]+)"|([^\s]+))', text, flags=re.MULTILINE):
-        name = (m.group(1) or m.group(2) or "").strip()
-        if name and name not in names:
-            names.append(name)
-    return names
 
 
 class LegacySSH:
@@ -319,30 +298,19 @@ def ssh_cmd(c, command, timeout=8):
 
 def ssh_mikrotik(c):
     identity=ssh_cmd(c,"/system identity print"); resource=ssh_cmd(c,"/system resource print"); health=ssh_cmd(c,"/system health print")
+    monitor=ssh_cmd(c,"/interface wireless monitor wlan1 once")
+    if not monitor: monitor=ssh_cmd(c,"/interface wifi monitor wlan1 once")
+    registration=ssh_cmd(c,"/interface wireless registration-table print detail")
+    if not registration: registration=ssh_cmd(c,"/interface wifi registration-table print detail")
     wireless_cfg=ssh_cmd(c,"/interface wireless print detail without-paging")
-    wireless_api="wireless"
-    if not wireless_cfg:
-        wireless_cfg=ssh_cmd(c,"/interface wifi print detail without-paging")
-        wireless_api="wifi"
-    interface_names=routeros_interface_names(wireless_cfg)
-    wireless_interface=interface_names[0] if interface_names else "wlan1"
-    monitor=ssh_cmd(c,f"/interface {wireless_api} monitor {wireless_interface} once")
-    if not monitor and wireless_api=="wireless":
-        monitor=ssh_cmd(c,f"/interface wifi monitor {wireless_interface} once")
-    elif not monitor and wireless_api=="wifi":
-        monitor=ssh_cmd(c,f"/interface wireless monitor {wireless_interface} once")
-    registration=ssh_cmd(c,f"/interface {wireless_api} registration-table print detail")
-    if not registration and wireless_api=="wireless":
-        registration=ssh_cmd(c,"/interface wifi registration-table print detail")
-    elif not registration and wireless_api=="wifi":
-        registration=ssh_cmd(c,"/interface wireless registration-table print detail")
+    if not wireless_cfg: wireless_cfg=ssh_cmd(c,"/interface wifi print detail without-paging")
     interfaces=ssh_cmd(c,"/interface print detail without-paging")
     queues=ssh_cmd(c,"/queue simple print detail without-paging")
     firewall=ssh_cmd(c,"/ip firewall filter print stats without-paging")
     pppoe=ssh_cmd(c,"/interface pppoe-client print detail without-paging")
     routes=ssh_cmd(c,"/ip route print detail without-paging")
     i=parse_equal_lines(identity+"\n"+resource); m=parse_key_value_lines(monitor); w=parse_equal_lines(wireless_cfg)
-    out={"device_type":"MikroTik","vendor":"MikroTik","hostname":i.get("name",""),"model":i.get("board-name","") or i.get("platform",""),"routeros_version":i.get("version",""),"firmware_version":i.get("version",""),"uptime":i.get("uptime",""),"interface_name":wireless_interface,"interfaces":interfaces,"wireless_registration":registration,"queues":queues,"firewall_counters":firewall,"pppoe_vpn":pppoe,"ip_routes":routes,"ssh_status":"success","ssh_raw":{"identity":identity,"resource":resource,"health":health,"monitor":monitor,"registration":registration,"wireless_interface":wireless_interface}}
+    out={"device_type":"MikroTik","vendor":"MikroTik","hostname":i.get("name",""),"model":i.get("board-name","") or i.get("platform",""),"routeros_version":i.get("version",""),"firmware_version":i.get("version",""),"uptime":i.get("uptime",""),"interfaces":interfaces,"wireless_registration":registration,"queues":queues,"firewall_counters":firewall,"pppoe_vpn":pppoe,"ip_routes":routes,"ssh_status":"success","ssh_raw":{"identity":identity,"resource":resource,"health":health,"monitor":monitor,"registration":registration}}
     mapping={"ssid":"ssid","channel":"channel","mode":"mode","frequency":"frequency","noise-floor":"noise_floor","signal-strength":"rx_power","tx-signal-strength":"peer_tx_signal","tx-rate":"tx_rate","rx-rate":"rx_rate","radio-name":"radio_name","signal-to-noise":"snr","tx-ccq":"tx_ccq","rx-ccq":"rx_ccq","overall-tx-ccq":"ccq","status":"wireless_status"}
     for src,dst in mapping.items():
         if m.get(src):out[dst]=m[src]
@@ -431,21 +399,12 @@ def scan_one(item: dict[str, Any]) -> dict[str, Any]:
             data["ssh_status"]="success";data["credential_id"]=method
         finally:c.close()
         # SSH fills only gaps; live API/SNMP data remains authoritative.
-        fields=("ssid","frequency","channel","bandwidth","mode","radio_name","interface_name","wireless_status","tx_power","rx_power","signal_strength","peer_tx_signal","tx_rate","rx_rate","ccq","tx_ccq","rx_ccq","snr","noise_floor","wireless_registration","interfaces","queues","firewall_counters","pppoe_vpn","ip_routes")
+        fields=("ssid","frequency","channel","bandwidth","mode","radio_name","wireless_status","tx_power","rx_power","signal_strength","peer_tx_signal","tx_rate","rx_rate","ccq","tx_ccq","rx_ccq","snr","noise_floor","wireless_registration","interfaces","queues","firewall_counters","pppoe_vpn","ip_routes")
         for f in fields:
             if not s(data.get(f)) and s(ssh_data.get(f)):data[f]=ssh_data[f]
         # For MikroTik, wireless rates/signals from SSH are the requested fallback when API monitor is absent.
     except Exception as exc:data["ssh_status"]=f"failed: {str(exc)[:180]}"
     data["raw_data"]=json.dumps({"snmp":sn,"api":api_data,"ssh":ssh_data},ensure_ascii=False,default=str)
-    protocol_ok = sn.get("snmp_status") == "success" or data.get("api_status") == "success" or data.get("ssh_status") == "success"
-    if not protocol_ok:
-        failed_reasons=[]
-        if sn.get("snmp_status") != "success": failed_reasons.append("SNMP failed")
-        if data.get("api_status","").startswith("failed"): failed_reasons.append(data["api_status"])
-        if data.get("ssh_status","").startswith("failed"): failed_reasons.append(data["ssh_status"])
-        reason = "; ".join(failed_reasons) or "No usable monitoring protocol responded"
-        result.update(status="failed",stage="collect",reason=reason,snapshot=data,before=before,after=None)
-        return result
     row=db.upsert_device(data);result.update(status="success",stage="collect",reason="; ".join(checks),snapshot=row,before=before,after=row);return result
 
 

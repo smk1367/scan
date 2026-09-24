@@ -46,34 +46,21 @@ def parse_sentence(words):
 class RouterOSAPI:
     def __init__(self,host,username,password,port=8728,timeout=4):
         self.host,self.username,self.password=host,username,password;self.port=int(port);self.timeout=float(timeout);self.sock=None
-    def _open_socket(self):
-        self.close()
-        self.sock=socket.create_connection((self.host,self.port),timeout=self.timeout)
-        self.sock.settimeout(self.timeout)
-
     def connect(self):
-        # RouterOS 6.43+ usually accepts username/password directly. If a
-        # legacy RouterOS build answers with a challenge, reconnect cleanly
-        # and complete the MD5 challenge on a fresh socket.
-        self._open_socket()
+        self.sock=socket.create_connection((self.host,self.port),timeout=self.timeout);self.sock.settimeout(self.timeout)
         try:
-            self._sentence(["/login",f"=name={self.username}",f"=password={self.password}"])
-            return
+            self._sentence(["/login",f"=name={self.username}",f"=password={self.password}"]);return
         except Exception:
-            self.close()
-
-        self._open_socket()
+            pass
         try:
             rows=self._sentence(["/login"])
             token=rows[0].get("ret") if rows else ""
-            if not token:
-                raise RouterOSAPIError("login challenge token missing")
-            digest=hashlib.md5(b"\x00"+self.password.encode()+bytes.fromhex(token)).hexdigest()
-            self._sentence(["/login",f"=name={self.username}",f"=response=00{digest}"])
-            return
+            if token:
+                digest=hashlib.md5(b"\x00"+self.password.encode()+bytes.fromhex(token)).hexdigest()
+                self._sentence(["/login",f"=name={self.username}",f"=response=00{digest}"]);return
         except Exception as exc:
-            self.close()
-            raise RouterOSAPIError(f"login failed: {exc}") from exc
+            self.close();raise RouterOSAPIError(f"login failed: {exc}") from exc
+        self.close();raise RouterOSAPIError("login failed")
     def close(self):
         if self.sock:
             try:self.sock.close()
@@ -121,17 +108,7 @@ def collect_mikrotik_api(c:RouterOSAPI)->dict[str,Any]:
             if health[0].get(k):out[k.replace("-","_")]=health[0][k]
 
     # Wireless configuration and live values. RouterOS 6 first, RouterOS 7 second.
-    wireless_rows=run("wireless",["/interface/wireless/print","/interface/wifi/print"])
-    interface_name=""
-    if wireless_rows:
-        for row in wireless_rows:
-            candidate=row.get("name") or row.get(".id") or ""
-            if candidate:
-                interface_name=candidate
-                if str(row.get("running","")).lower() in {"true","yes","1"}:
-                    break
-        if interface_name:
-            out["interface_name"]=interface_name
+    run("wireless",["/interface/wireless/print","/interface/wifi/print"])
     run("interfaces",["/interface/print"])
     run("pppoe",["/interface/pppoe-client/print"])
     run("queues",["/queue/simple/print","/queue/tree/print"])
@@ -141,12 +118,10 @@ def collect_mikrotik_api(c:RouterOSAPI)->dict[str,Any]:
     run("bridges",["/interface/bridge/print","/interface/bridge/port/print"])
     run("registration",["/interface/wireless/registration-table/print","/interface/wifi/registration-table/print"])
 
-    monitor_interface=out.get("interface_name","wlan1")
     for path in ("/interface/wireless/monitor","/interface/wifi/monitor"):
         try:
-            rows=c.command(path,once="",numbers=monitor_interface)
+            rows=c.command(path,once="",numbers="wlan1")
             if rows:
                 out["radio_path"]=path;out["radio"]=rows[0];break
-        except Exception as exc:
-            out["api_errors"]["radio_monitor"]=f"{path} {monitor_interface}: {str(exc)[:180]}"
+        except Exception as exc:out["api_errors"]["radio_monitor"]=f"{path}: {str(exc)[:180]}"
     return out

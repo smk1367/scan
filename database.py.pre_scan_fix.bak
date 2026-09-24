@@ -33,7 +33,6 @@ CREATE TABLE IF NOT EXISTS devices (
     bandwidth TEXT,
     mode TEXT,
     radio_name TEXT,
-    interface_name TEXT,
     wireless_status TEXT,
     tx_power TEXT,
     rx_power TEXT,
@@ -180,7 +179,7 @@ CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NU
 
 TRACKED_FIELDS = (
     "city_id", "device_type", "hostname", "model", "routeros_version", "ssid", "frequency",
-    "channel", "bandwidth", "mode", "radio_name", "interface_name", "wireless_status", "tx_power", "rx_power",
+    "channel", "bandwidth", "mode", "radio_name", "wireless_status", "tx_power", "rx_power",
     "signal_strength", "peer_tx_signal", "tx_rate", "rx_rate", "ccq", "tx_ccq", "rx_ccq", "snr",
     "noise_floor", "temperature", "cpu_load", "memory_usage", "uptime", "scan_status"
 )
@@ -214,7 +213,7 @@ def init_db() -> None:
         _ensure_columns(c, "devices", {name: "TEXT" for name in (
             "city_id", "city", "device_type", "vendor", "hostname", "model", "routeros_version",
             "firmware_version", "serial_number", "mac_address", "ssid", "frequency", "channel",
-            "bandwidth", "mode", "radio_name", "interface_name", "wireless_status", "tx_power", "rx_power",
+            "bandwidth", "mode", "radio_name", "wireless_status", "tx_power", "rx_power",
             "signal_strength", "peer_tx_signal", "tx_rate", "rx_rate", "ccq", "tx_ccq", "rx_ccq",
             "snr", "noise_floor", "temperature", "cpu_load", "memory_usage", "uptime", "interfaces",
             "wireless_registration", "queues", "firewall_counters", "pppoe_vpn", "ip_routes", "bridges",
@@ -290,7 +289,7 @@ def upsert_device(data: dict[str, Any]) -> dict[str, Any]:
         protected={"latitude":"manual_latitude","longitude":"manual_longitude","province":"manual_province","city":"manual_city","antenna_gain":"manual_antenna_gain","polarization":"manual_polarization","capacity":"manual_capacity"}
         fields=[
             "ip_address","city_id","city","device_type","vendor","hostname","model","routeros_version","firmware_version","serial_number","mac_address",
-            "ssid","frequency","channel","bandwidth","mode","radio_name","interface_name","wireless_status","tx_power","rx_power","signal_strength","peer_tx_signal",
+            "ssid","frequency","channel","bandwidth","mode","radio_name","wireless_status","tx_power","rx_power","signal_strength","peer_tx_signal",
             "tx_rate","rx_rate","ccq","tx_ccq","rx_ccq","snr","noise_floor","temperature","cpu_load","memory_usage","uptime","interfaces",
             "wireless_registration","queues","firewall_counters","pppoe_vpn","ip_routes","bridges","raw_data","snmp_status","api_status","ssh_status",
             "credential_id","last_seen","last_updated","scan_status"

@@ -1,0 +1,449 @@
+[1mdiff --git a/scanner.py b/scanner.py[m
+[1mdeleted file mode 100644[m
+[1mindex 4e6e1e1..0000000[m
+[1m--- a/scanner.py[m
+[1m+++ /dev/null[m
+[36m@@ -1,443 +0,0 @@[m
+[31m-#!/usr/bin/env python3[m
+[31m-# -*- coding: utf-8 -*-[m
+[31m-"""Multi-city SNMP + RouterOS API + SSH scanner.[m
+[31m-[m
+[31m-Rules:[m
+[31m-- Each city has its own CIDR, SSH/SNMP/API ports, SSH credentials and SNMP communities.[m
+[31m-- RouterOS API is always plain TCP only (8728 by default). API-SSL is deliberately disabled.[m
+[31m-- SNMP owns system/health/interfaces; RouterOS API owns wireless/topology; SSH is fallback.[m
+[31m-- MikroTik wireless RX/TX fields are never simulated.[m
+[31m-"""[m
+[31m-from __future__ import annotations[m
+[31m-[m
+[31m-import asyncio[m
+[31m-import concurrent.futures[m
+[31m-import ipaddress[m
+[31m-import json[m
+[31m-import logging[m
+[31m-import os[m
+[31m-import re[m
+[31m-import shutil[m
+[31m-import socket[m
+[31m-import subprocess[m
+[31m-import time[m
+[31m-from typing import Any[m
+[31m-[m
+[31m-import paramiko[m
+[31m-[m
+[31m-from database import ([m
+[31m-    add_scan_result,[m
+[31m-    cleanup_retention,[m
+[31m-    create_scan,[m
+[31m-    finish_scan,[m
+[31m-    get_device,[m
+[31m-    init_db,[m
+[31m-    is_blacklisted,[m
+[31m-    list_cities,[m
+[31m-    list_manual_ips,[m
+[31m-    record_changes,[m
+[31m-    upsert_device,[m
+[31m-)[m
+[31m-from routeros_api import RouterOSAPI, collect_mikrotik_api[m
+[31m-[m
+[31m-try:[m
+[31m-    from pysnmp.hlapi.v1arch.asyncio import SnmpDispatcher, CommunityData, UdpTransportTarget, get_cmd[m
+[31m-except Exception:[m
+[31m-    SnmpDispatcher = CommunityData = UdpTransportTarget = get_cmd = None[m
+[31m-[m
+[31m-LOG = logging.getLogger(__name__)[m
+[31m-[m
+[31m-STANDARD_OIDS = {[m
+[31m-    "sysDescr": "1.3.6.1.2.1.1.1.0",[m
+[31m-    "sysObjectID": "1.3.6.1.2.1.1.2.0",[m
+[31m-    "sysUpTime": "1.3.6.1.2.1.1.3.0",[m
+[31m-    "sysName": "1.3.6.1.2.1.1.5.0",[m
+[31m-    "hrProcessorLoad": "1.3.6.1.2.1.25.3.3.1.2.1",[m
+[31m-    "memTotalReal": "1.3.6.1.4.1.2021.4.5.0",[m
+[31m-    "memAvailReal": "1.3.6.1.4.1.2021.4.6.0",[m
+[31m-    "mtTemperature": "1.3.6.1.4.1.14988.1.1.3.10.0",[m
+[31m-    "mtCpuTemperature": "1.3.6.1.4.1.14988.1.1.3.11.0",[m
+[31m-}[m
+[31m-[m
+[31m-IF_OIDS = {[m
+[31m-    "name": "1.3.6.1.2.1.31.1.1.1.1",[m
+[31m-    "descr": "1.3.6.1.2.1.2.2.1.2",[m
+[31m-    "oper": "1.3.6.1.2.1.2.2.1.8",[m
+[31m-    "admin": "1.3.6.1.2.1.2.2.1.7",[m
+[31m-    "in_octets": "1.3.6.1.2.1.31.1.1.1.6",[m
+[31m-    "out_octets": "1.3.6.1.2.1.31.1.1.1.10",[m
+[31m-    "in_errors": "1.3.6.1.2.1.2.2.1.14",[m
+[31m-    "out_errors": "1.3.6.1.2.1.2.2.1.20",[m
+[31m-}[m
+[31m-[m
+[31m-[m
+[31m-def s(v: Any) -> str:[m
+[31m-    return "" if v is None else str(v).strip()[m
+[31m-[m
+[31m-[m
+[31m-def normdbm(v: Any) -> str:[m
+[31m-    text = s(v)[m
+[31m-    if not text:[m
+[31m-        return ""[m
+[31m-    m = re.search(r"-?\d+(?:\.\d+)?", text)[m
+[31m-    return f"{m.group(0)} dBm" if m else text[m
+[31m-[m
+[31m-[m
+[31m-def city_credentials(city: dict[str, Any]) -> tuple[list[dict[str, str]], list[str]]:[m
+[31m-    try:[m
+[31m-        ssh = json.loads(city.get("ssh_credentials_json") or "[]")[m
+[31m-    except Exception:[m
+[31m-        ssh = [][m
+[31m-    if not ssh:[m
+[31m-        try:[m
+[31m-            ssh = json.loads(os.getenv("SSH_CREDENTIALS_JSON", "[]") or "[]")[m
+[31m-        except Exception:[m
+[31m-            ssh = [][m
+[31m-    if not ssh and os.getenv("SSH_USER", "").strip():[m
+[31m-        ssh = [{"username": os.getenv("SSH_USER", ""), "password": os.getenv("SSH_PASS", ""), "id": "default"}][m
+[31m-    ssh_out = [][m
+[31m-    for idx, item in enumerate(ssh, 1):[m
+[31m-        if isinstance(item, dict) and s(item.get("username")):[m
+[31m-            ssh_out.append({"username": s(item["username"]), "password": s(item.get("password", "")), "id": s(item.get("id")) or f"city-{idx}"})[m
+[31m-[m
+[31m-    try:[m
+[31m-        snmp = json.loads(city.get("snmp_communities_json") or "[]")[m
+[31m-    except Exception:[m
+[31m-        snmp = [][m
+[31m-    communities = [][m
+[31m-    for item in snmp:[m
+[31m-        if isinstance(item, str) and item.strip():[m
+[31m-            communities.append(item.strip())[m
+[31m-        elif isinstance(item, dict) and s(item.get("community")):[m
+[31m-            communities.append(s(item["community"]))[m
+[31m-    if not communities:[m
+[31m-        communities = [os.getenv("SNMP_COMMUNITY", "ngstehwl").strip() or "ngstehwl"][m
+[31m-    return ssh_out, list(dict.fromkeys(communities))[m
+[31m-[m
+[31m-[m
+[31m-async def _snmp_get_async(ip: str, port: int, community: str, oids: list[str], timeout: float, retries: int) -> dict[str, str]:[m
+[31m-    if not get_cmd or not SnmpDispatcher:[m
+[31m-        return {}[m
+[31m-    disp = SnmpDispatcher()[m
+[31m-    try:[m
+[31m-        target = await UdpTransportTarget.create((ip, port), timeout=float(timeout), retries=int(retries))[m
+[31m-        res = await get_cmd(disp, CommunityData(community, mpModel=1), target, *[(oid, None) for oid in oids])[m
+[31m-        err_indication, err_status, _, var_binds = res[m
+[31m-        if err_indication or err_status:[m
+[31m-            return {}[m
+[31m-        return {s(oid): s(v.prettyPrint() if hasattr(v, "prettyPrint") else v) for oid, v in var_binds}[m
+[31m-    except Exception:[m
+[31m-        return {}[m
+[31m-    finally:[m
+[31m-        try:[m
+[31m-            disp.close_dispatcher()[m
+[31m-        except Exception:[m
+[31m-            pass[m
+[31m-[m
+[31m-[m
+[31m-def snmp_get(ip: str, city: dict[str, Any], oids: list[str]) -> tuple[dict[str, str], str]:[m
+[31m-    for community in city_credentials(city)[1]:[m
+[31m-        try:[m
+[31m-            result = asyncio.run(_snmp_get_async(ip, int(city["snmp_port"]), community, oids, float(city["snmp_timeout"]), int(city["snmp_retries"])))[m
+[31m-            if result:[m
+[31m-                return result, community[m
+[31m-        except Exception as exc:[m
+[31m-            LOG.debug("SNMP %s failed: %s", ip, exc)[m
+[31m-    return {}, ""[m
+[31m-[m
+[31m-[m
+[31m-def snmp_collect(ip: str, city: dict[str, Any]) -> dict[str, Any]:[m
+[31m-    values, community = snmp_get(ip, city, list(STANDARD_OIDS.values()))[m
+[31m-    reverse = {v: k for k, v in STANDARD_OIDS.items()}[m
+[31m-    by = {reverse.get(k, k): v for k, v in values.items()}[m
+[31m-    out: dict[str, Any] = {[m
+[31m-        "snmp_status": "success" if values else "failed",[m
+[31m-        "snmp_community": community,[m
+[31m-        "snmp_raw": by,[m
+[31m-    }[m
+[31m-    if not values:[m
+[31m-        return out[m
+[31m-[m
+[31m-    descr = s(by.get("sysDescr"))[m
+[31m-    obj = s(by.get("sysObjectID"))[m
+[31m-    ident_text = (descr + " " + obj).lower()[m
+[31m-    if "mikrotik" in ident_text or "routeros" in ident_text:[m
+[31m-        out.update(device_type="MikroTik", vendor="MikroTik")[m
+[31m-    elif "racom" in ident_text or "33555" in obj or "microwave link" in ident_text:[m
+[31m-        out.update(device_type="Racom", vendor="Racom")[m
+[31m-    elif "mimosa" in ident_text or "43356" in obj:[m
+[31m-        out.update(device_type="Mimosa", vendor="Mimosa")[m
+[31m-    elif "cisco" in ident_text or "ios" in ident_text:[m
+[31m-        out.update(device_type="Cisco", vendor="Cisco")[m
+[31m-[m
+[31m-    out.update({"hostname": s(by.get("sysName")), "firmware_version": descr, "uptime": s(by.get("sysUpTime"))})[m
+[31m-[m
+[31m-    cpu = s(by.get("hrProcessorLoad"))[m
+[31m-    if cpu:[m
+[31m-        out["cpu_load"] = cpu if cpu.endswith("%") else f"{cpu}%"[m
+[31m-    try:[m
+[31m-        total = float(re.sub(r"[^0-9.]", "", s(by.get("memTotalReal"))) or 0)[m
+[31m-        free = float(re.sub(r"[^0-9.]", "", s(by.get("memAvailReal"))) or 0)[m
+[31m-        if total:[m
+[31m-            out["memory_usage"] = f"{max(0.0, (1.0 - free / total) * 100.0):.1f}%"[m
+[31m-    except Exception:[m
+[31m-        pass[m
+[31m-    for key in ("mtTemperature", "mtCpuTemperature"):[m
+[31m-        if s(by.get(key)):[m
+[31m-            target = "temperature" if key == "mtTemperature" else "cpu_temperature"[m
+[31m-            try:[m
+[31m-                out[target] = f"{float(re.sub(r'[^0-9.-]', '', s(by[key])))/10:.1f} C"[m
+[31m-            except Exception:[m
+[31m-                pass[m
+[31m-[m
+[31m-    # Full Interface status/traffic comes from IF-MIB over SNMP.  This is[m
+[31m-    # intentionally isolated: a failed walk must never fail the device scan.[m
+[31m-    community = community[m
+[31m-    if community and shutil.which("snmpbulkwalk"):[m
+[31m-        try:[m
+[31m-            base_rows = {}[m
+[31m-            for label, oid in IF_OIDS.items():[m
+[31m-                cmd = [[m
+[31m-                    "snmpbulkwalk", "-v2c", "-c", community, "-On",[m
+[31m-                    "-t", str(float(city["snmp_timeout"])),[m
+[31m-                    "-r", str(int(city["snmp_retries"])), ip, oid[m
+[31m-                ][m
+[31m-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(4, int(float(city["snmp_timeout"])) * 3 + 2))[m
+[31m-                if proc.returncode != 0:[m
+[31m-                    continue[m
+[31m-                for line in proc.stdout.splitlines():[m
+[31m-                    m = re.match(r"^([^ ]+)\s*=\s*(.*)$", line.strip())[m
+[31m-                    if not m:[m
+[31m-                        continue[m
+[31m-                    full_oid, raw = m.group(1), m.group(2)[m
+[31m-                    idx = full_oid.rsplit(".", 1)[-1][m
+[31m-                    value = raw.split(":", 1)[1].strip() if ":" in raw else raw.strip()[m
+[31m-                    base_rows.setdefault(idx, {})[label] = value[m
+[31m-            if base_rows:[m
+[31m-                out["interfaces"] = json.dumps([m
+[31m-                    [{"index": idx, **vals} for idx, vals in sorted(base_rows.items(), key=lambda x: x[0])],[m
+[31m-                    ensure_ascii=False,[m
+[31m-                )[m
+[31m-        except Exception as exc:[m
+[31m-            LOG.debug("SNMP interface walk %s failed: %s", ip, exc)[m
+[31m-    return out[m
+[31m-[m
+[31m-[m
+[31m-def tcp_open(ip: str, port: int, timeout: float = 1.0) -> bool:[m
+[31m-    try:[m
+[31m-        with socket.create_connection((ip, int(port)), timeout=float(timeout)):[m
+[31m-            return True[m
+[31m-    except Exception:[m
+[31m-        return False[m
+[31m-[m
+[31m-[m
+[31m-def precheck(ip: str, city: dict[str, Any]) -> list[str]:[m
+[31m-    reasons=[][m
+[31m-    if tcp_open(ip, city["snmp_port"]): reasons.append("SNMP")[m
+[31m-    # IMPORTANT: never probe/use 8729.[m
+[31m-    if int(city.get("api_enabled", 1)) and int(city.get("api_ssl_enabled", 0)) == 0 and tcp_open(ip, city["api_port"]): reasons.append(f"API {city['api_port']}")[m
+[31m-    if tcp_open(ip, city["ssh_port"]): reasons.append("SSH")[m
+[31m-    try:[m
+[31m-        rc=subprocess.run(["ping","-c","1","-W","1",ip],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=2).returncode[m
+[31m-        if rc==0: reasons.append("ICMP")[m
+[31m-    except Exception: pass[m
+[31m-    return reasons[m
+[31m-[m
+[31m-[m
+[31m-def parse_key_value_lines(text: str) -> dict[str, str]:[m
+[31m-    out={}[m
+[31m-    for line in text.replace("\r","").splitlines():[m
+[31m-        m=re.match(r"^\s*([A-Za-z][A-Za-z0-9_.-]*)\s*:\s*(.*?)\s*$",line)[m
+[31m-        if m:out[m.group(1).lower()]=m.group(2).strip()[m
+[31m-    return out[m
+[31m-[m
+[31m-[m
+[31m-def parse_equal_lines(text: str) -> dict[str, str]:[m
+[31m-    out={}[m
+[31m-    for line in text.replace("\r","").splitlines():[m
+[31m-        for m in re.finditer(r'([A-Za-z][A-Za-z0-9_.-]*)\s*=\s*(?:"([^"]*)"|([^\s]+))',line):[m
+[31m-            out[m.group(1).lower()]=m.group(2) if m.group(2) is not None else m.group(3)[m
+[31m-    return out[m
+[31m-[m
+[31m-[m
+[31m-class LegacySSH:[m
+[31m-    def __init__(self, ip: str, username: str, password: str, port: int): self.ip,self.username,self.password,self.port=ip,username,password,port[m
+[31m-    def exec_command(self, command: str, timeout: float = 8):[m
+[31m-        env=os.environ.copy(); env["SSHPASS"]=self.password[m
+[31m-        opts=["-o","StrictHostKeyChecking=no","-o","UserKnownHostsFile=/dev/null","-o",f"ConnectTimeout={max(1,int(timeout))}","-o","HostKeyAlgorithms=+ssh-rsa,ssh-dss","-o","KexAlgorithms=+diffie-hellman-group1-sha1,diffie-hellman-group14-sha1","-p",str(self.port)][m
+[31m-        p=subprocess.run(["sshpass","-e","ssh",*opts,f"{self.username}@{self.ip}",command],env=env,text=True,capture_output=True,timeout=max(10,int(timeout)+5))[m
+[31m-        return None, _Out(p.stdout), _Out(p.stderr)[m
+[31m-    def close(self): pass[m
+[31m-class _Out:[m
+[31m-    def __init__(self,x): self.x=x[m
+[31m-    def read(self): return self.x.encode("utf-8","replace")[m
+[31m-[m
+[31m-[m
+[31m-def ssh_connect(ip: str, city: dict[str, Any]):[m
+[31m-    creds,_=city_credentials(city); last=None[m
+[31m-    for cred in creds:[m
+[31m-        try:[m
+[31m-            c=paramiko.SSHClient();c.set_missing_host_key_policy(paramiko.AutoAddPolicy());c.connect(ip,port=int(city["ssh_port"]),username=cred["username"],password=cred["password"],timeout=float(city["ssh_timeout"]),banner_timeout=float(city["ssh_timeout"]),auth_timeout=float(city["ssh_timeout"]),allow_agent=False,look_for_keys=False);return c,f"ssh:{cred['id']}"[m
+[31m-        except Exception as exc:last=exc[m
+[31m-    if os.getenv("LEGACY_SSH_FALLBACK","1").lower() in {"1","true","yes","on"} and shutil.which("sshpass"):[m
+[31m-        for cred in creds:[m
+[31m-            try:[m
+[31m-                c=LegacySSH(ip,cred["username"],cred["password"],int(city["ssh_port"]))[m
+[31m-                _,o,e=c.exec_command("/system identity print",timeout=float(city["ssh_timeout"]));txt=o.read().decode("utf-8","replace").strip()[m
+[31m-                if txt:return c,f"ssh-legacy:{cred['id']}"[m
+[31m-                last=RuntimeError(e.read().decode("utf-8","replace")[:200] or "Legacy SSH failed")[m
+[31m-            except Exception as exc:last=exc[m
+[31m-    raise RuntimeError(str(last or "No SSH credentials"))[m
+[31m-[m
+[31m-[m
+[31m-def ssh_cmd(c, command, timeout=8):[m
+[31m-    try:[m
+[31m-        _,o,_=c.exec_command(command,timeout=timeout);return o.read().decode("utf-8","replace").strip()[m
+[31m-    except Exception:return ""[m
+[31m-[m
+[31m-[m
+[31m-def ssh_mikrotik(c):[m
+[31m-    identity=ssh_cmd(c,"/system identity print"); resource=ssh_cmd(c,"/system resource print"); health=ssh_cmd(c,"/system health print")[m
+[31m-    monitor=ssh_cmd(c,"/interface wireless monitor wlan1 once")[m
+[31m-    if not monitor: monitor=ssh_cmd(c,"/interface wifi monitor wlan1 once")[m
+[31m-    registration=ssh_cmd(c,"/interface wireless registration-table print detail")[m
+[31m-    if not registration: registration=ssh_cmd(c,"/interface wifi registration-table print detail")[m
+[31m-    wireless_cfg=ssh_cmd(c,"/interface wireless print detail without-paging")[m
+[31m-    if not wireless_cfg: wireless_cfg=ssh_cmd(c,"/interface wifi print detail without-paging")[m
+[31m-    interfaces=ssh_cmd(c,"/interface print detail without-paging")[m
+[31m-    queues=ssh_cmd(c,"/queue simple print detail without-paging")[m
+[31m-    firewall=ssh_cmd(c,"/ip firewall filter print stats without-paging")[m
+[31m-    pppoe=ssh_cmd(c,"/interface pppoe-client print detail without-paging")[m
+[31m-    routes=ssh_cmd(c,"/ip route print detail without-paging")[m
+[31m-    i=parse_equal_lines(identity+"\n"+resource); m=parse_key_value_lines(monitor); w=parse_equal_lines(wireless_cfg)[m
+[31m-    out={"device_type":"MikroTik","vendor":"MikroTik","hostname":i.get("name",""),"model":i.get("board-name","") or i.get("platform",""),"routeros_version":i.get("version",""),"firmware_version":i.get("version",""),"uptime":i.get("uptime",""),"interfaces":interfaces,"wireless_registration":registration,"queues":queues,"firewall_counters":firewall,"pppoe_vpn":pppoe,"ip_routes":routes,"ssh_status":"success","ssh_raw":{"identity":identity,"resource":resource,"health":health,"monitor":monitor,"registration":registration}}[m
+[31m-    mapping={"ssid":"ssid","channel":"channel","mode":"mode","frequency":"frequency","noise-floor":"noise_floor","signal-strength":"rx_power","tx-signal-strength":"peer_tx_signal","tx-rate":"tx_rate","rx-rate":"rx_rate","radio-name":"radio_name","signal-to-noise":"snr","tx-ccq":"tx_ccq","rx-ccq":"rx_ccq","overall-tx-ccq":"ccq","status":"wireless_status"}[m
+[31m-    for src,dst in mapping.items():[m
+[31m-        if m.get(src):out[dst]=m[src][m
+[31m-    if not out.get("ssid"):out["ssid"]=w.get("ssid","")[m
+[31m-    if not out.get("mode"):out["mode"]=w.get("mode","")[m
+[31m-    if out.get("rx_power"):out["rx_power"]=normdbm(out["rx_power"]);out["signal_strength"]=out["rx_power"][m
+[31m-    if out.get("peer_tx_signal"):out["peer_tx_signal"]=normdbm(out["peer_tx_signal"])[m
+[31m-    if out.get("noise_floor"):out["noise_floor"]=normdbm(out["noise_floor"])[m
+[31m-    ch=s(out.get("channel")); mm=re.match(r"^(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)",ch)[m
+[31m-    if mm:out["frequency"]=mm.group(1);out["bandwidth"]=mm.group(2)+" MHz"[m
+[31m-    out["mac_address"]=w.get("mac-address","")[m
+[31m-    return out[m
+[31m-[m
+[31m-[m
+[31m-def merge_nonempty(dst: dict[str, Any], src: dict[str, Any], preserve: set[str] | None = None):[m
+[31m-    preserve=preserve or set()[m
+[31m-    for k,v in src.items():[m
+[31m-        if k in preserve:continue[m
+[31m-        if s(v):dst[k]=v[m
+[31m-[m
+[31m-[m
+[31m-def normalize_api_data(api: dict[str, Any]) -> dict[str, Any]:[m
+[31m-    """Flatten RouterOS API runtime radio/topology into dashboard fields."""[m
+[31m-    out={}[m
+[31m-    radio=api.get("radio") or {}[m
+[31m-    if isinstance(radio,dict):[m
+[31m-        mapping={[m
+[31m-            "ssid":"ssid","frequency":"frequency","channel":"channel","channel-width":"bandwidth","bandwidth":"bandwidth",[m
+[31m-            "mode":"mode","signal-strength":"rx_power","tx-signal-strength":"peer_tx_signal","tx-rate":"tx_rate","rx-rate":"rx_rate",[m
+[31m-            "signal-to-noise":"snr","noise-floor":"noise_floor","tx-ccq":"tx_ccq","rx-ccq":"rx_ccq","overall-tx-ccq":"ccq",[m
+[31m-            "radio-name":"radio_name","status":"wireless_status"[m
+[31m-        }[m
+[31m-        for src,dst in mapping.items():[m
+[31m-            if s(radio.get(src)):out[dst]=radio[src][m
+[31m-        if out.get("rx_power"):out["rx_power"]=normdbm(out["rx_power"]);out["signal_strength"]=out["rx_power"][m
+[31m-        if out.get("peer_tx_signal"):out["peer_tx_signal"]=normdbm(out["peer_tx_signal"])[m
+[31m-        if out.get("noise_floor"):out["noise_floor"]=normdbm(out["noise_floor"])[m
+[31m-    wireless=api.get("api_menus",{}).get("wireless") or [][m
+[31m-    if isinstance(wireless,list) and wireless:wireless=wireless[0][m
+[31m-    if isinstance(wireless,dict):[m
+[31m-        for src,dst in (("ssid","ssid"),("channel","channel"),("frequency","frequency"),("channel-width","bandwidth"),("mode","mode"),("antenna-gain","antenna_gain"),("polarization","polarization"),("tx-power","tx_power"),("mac-address","mac_address")):[m
+[31m-            if not s(out.get(dst)) and s(wireless.get(src)):out[dst]=wireless[src][m
+[31m-    menus=api.get("api_menus",{})[m
+[31m-    for key,dst in (("registration","wireless_registration"),("interfaces","interfaces"),("queues","queues"),("firewall_filter","firewall_counters"),("pppoe","pppoe_vpn"),("routes","ip_routes"),("bridges","bridges")):[m
+[31m-        val=menus.get(key)[m
+[31m-        if val:out[dst]=json.dumps(val,ensure_ascii=False,default=str)[m
+[31m-    return out[m
+[31m-[m
+[31m-[m
+[31m-def scan_one(item: dict[str, Any]) -> dict[str, Any]:[m
+[31m-    ip=item["ip_address"]; city=item["city"]; result={"ip_address":ip,"city_id":city["id"],"city_name":city["name"],"status":"failed","stage":"precheck","reason":"","snapshot":{}}[m
+[31m-    if is_blacklisted(ip):result.update(status="blacklisted",stage="target",reason="IP or CIDR is blacklisted");return result[m
+[31m-    checks=precheck(ip,city); result["precheck"]=checks[m
+[31m-    if not checks:result.update(status="not_alive",reason="No response on SNMP/API/SSH/ICMP");return result[m
+[31m-    before=get_device(ip);data={"ip_address":ip,"city_id":city["id"],"city":city["name"],"scan_status":"success"}[m
+[31m-    sn=snmp_collect(ip,city);merge_nonempty(data,{k:v for k,v in sn.items() if k not in {"snmp_raw","snmp_community"}})[m
+[31m-    api_data={}[m
+[31m-    # Try plain RouterOS API when enabled. A successful API login can[m
+[31m-    # identify MikroTik even when SNMP is unavailable. API-SSL is never used.[m
+[31m-    if int(city.get("api_enabled",1)) and int(city.get("api_ssl_enabled",0))==0:[m
+[31m-        creds,_=city_credentials(city)[m
+[31m-        for cred in creds:[m
+[31m-            ac=None[m
+[31m-            try:[m
+[31m-                ac=RouterOSAPI(ip,cred["username"],cred["password"],port=int(city["api_port"]),timeout=float(city["api_timeout"]))[m
+[31m-                ac.connect();api_data=collect_mikrotik_api(ac);data["api_status"]="success";break[m
+[31m-            except Exception as exc:[m
+[31m-                data["api_status"]=f"failed: {str(exc)[:180]}"[m
+[31m-            finally:[m
+[31m-                if ac:ac.close()[m
+[31m-        merge_nonempty(data,api_data,preserve={"api_menus","api_errors","api_source","api_status"})[m
+[31m-        merge_nonempty(data,normalize_api_data(api_data))[m
+[31m-        if not data.get("device_type") and (api_data.get("routeros_version") or api_data.get("board_name") or api_data.get("radio")):[m
+[31m-            data.update(device_type="MikroTik",vendor="MikroTik")[m
+[31m-    elif data.get("device_type")=="MikroTik":[m
+[31m-        data["api_status"]="disabled"[m
+[31m-    ssh_data={}[m
+[31m-    try:[m
+[31m-        c,method=ssh_connect(ip,city)[m
+[31m-        try:[m
+[31m-            identity_probe=ssh_cmd(c,"/system identity print")[m
+[31m-            resource_probe=ssh_cmd(c,"/system resource print")[m
+[31m-            if data.get("device_type")=="MikroTik" or "routeros" in (resource_probe+identity_probe).lower() or "name:" in identity_probe.lower():[m
+[31m-                data.update(device_type="MikroTik",vendor="MikroTik")[m
+[31m-                ssh_data=ssh_mikrotik(c)[m
+[31m-            data["ssh_status"]="success";data["credential_id"]=method[m
+[31m-        finally:c.close()[m
+[31m-        # SSH fills only gaps; live API/SNMP data remains authoritative.[m
+[31m-        fields=("ssid","frequency","channel","bandwidth","mode","radio_name","wireless_status","tx_power","rx_power","signal_strength","peer_tx_signal","tx_rate","rx_rate","ccq","tx_ccq","rx_ccq","snr","noise_floor","wireless_registration","interfaces","queues","firewall_counters","pppoe_vpn","ip_routes")[m
+[31m-        for f in fields:[m
+[31m-            if not s(data.get(f)) and s(ssh_data.get(f)):data[f]=ssh_data[f][m
+[31m-        # For MikroTik, wireless rates/signals from SSH are the requested fallback when API monitor is absent.[m
+[31m-    except Exception as exc:data["ssh_status"]=f"failed: {str(exc)[:180]}"[m
+[31m-    data["raw_data"]=json.dumps({"snmp":sn,"api":api_data,"ssh":ssh_data},ensure_ascii=False,default=str)[m
+[31m-    row=db.upsert_device(data);result.update(status="success",stage="collect",reason="; ".join(checks),snapshot=row,before=before,after=row);return result[m
+[31m-[m
+[31m-[m
+[31m-def targets(city_ids: list[int] | None=None):[m
+[31m-    cities=[c for c in list_cities() if c["enabled"]]; selected=set(city_ids or [])[m
+[31m-    if selected:cities=[c for c in cities if c["id"] in selected][m
+[31m-    out=[];seen=set()[m
+[31m-    for city in cities:[m
+[31m-        try:[m
+[31m-            for ip in ipaddress.ip_network(city["cidr"],strict=False).hosts():[m
+[31m-                sip=str(ip)[m
+[31m-                if sip not in seen:seen.add(sip);out.append({"ip_address":sip,"city":city})[m
+[31m-        except Exception:continue[m
+[31m-    # Manual IPs use legacy/global credentials and ports.[m
+[31m-    for m in list_manual_ips():[m
+[31m-        if not m["enabled"] or m["ip_address"] in seen:continue[m
+[31m-        seen.add(m["ip_address"]);out.append({"ip_address":m["ip_address"],"city":{"id":None,"name":"Manual","enabled":1,"ssh_port":int(os.getenv("SSH_PORT","22")),"snmp_port":int(os.getenv("SNMP_PORT","161")),"api_port":int(os.getenv("API_PORT","8728")),"api_enabled":1,"api_ssl_enabled":0,"api_timeout":float(os.getenv("API_TIMEOUT","4")),"snmp_timeout":float(os.getenv("SNMP_TIMEOUT","2.5")),"snmp_retries":int(os.getenv("SNMP_RETRIES","1")),"ssh_timeout":float(os.getenv("SSH_TIMEOUT","6")),"ssh_credentials_json":os.getenv("SSH_CREDENTIALS_JSON","[]"),"snmp_communities_json":json.dumps([os.getenv("SNMP_COMMUNITY","ngstehwl")])}})[m
+[31m-    return out[m
+[31m-[m
+[31m-[m
+[31m-def run_scan(city_ids: list[int] | None=None, started_by: str="system"):[m
+[31m-    init_db(); items=targets(city_ids); selected=[c["name"] for c in list_cities() if c["enabled"] and (not city_ids or c["id"] in city_ids)][m
+[31m-    selection={"mode":"all" if not city_ids else "selected","city_ids":city_ids or [],"cities":selected}[m
+[31m-    scan_id=create_scan(selection,started_by,len(items)); stats={"found":0,"success":0,"failed":0,"skipped":0};start=time.time()[m
+[31m-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(100,max(1,int(os.getenv("SCAN_WORKERS","40"))))) as pool:[m
+[31m-        futures=[pool.submit(scan_one,x) for x in items][m
+[31m-        for fut in concurrent.futures.as_completed(futures):[m
+[31m-            try:r=fut.result()[m
+[31m-            except Exception as exc:r={"ip_address":"?","status":"failed","stage":"exception","reason":str(exc)[:300],"snapshot":{}}[m
+[31m-            st=r.get("status")[m
+[31m-            if st=="success":stats["success"]+=1;stats["found"]+=1;db_before=r.get("before");db_after=r.get("after");[m
+[31m-            elif st in {"not_alive","blacklisted","skipped"}:stats["skipped"]+=1[m
+[31m-            else:stats["failed"]+=1;stats["found"]+=1[m
+[31m-            if st=="success" and r.get("ip_address")!="?":record_changes(scan_id,r["ip_address"],r.get("before"),r.get("after"))[m
+[31m-            add_scan_result(scan_id,r)[m
+[31m-    duration=time.time()-start;finish_scan(scan_id,stats,duration);cleanup_retention();return {"scan_id":scan_id,"total_ips":len(items),**stats,"duration":duration,"selection":selection}[m
