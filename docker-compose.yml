@@ -1,0 +1,44 @@
+services:
+  wireless-monitor:
+    build:
+      context: .
+    image: wireless-monitor-enterprise:latest
+    container_name: wireless-monitor
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      PORT: ${PORT:-5000}
+      DB_PATH: ${DB_PATH:-/app/data/data.db}
+      SCAN_NETWORK: ${SCAN_NETWORK:-172.17.240.0/20}
+      SCAN_WORKERS: ${SCAN_WORKERS:-40}
+      PRECHECK_TIMEOUT: ${PRECHECK_TIMEOUT:-1.2}
+      SSH_PORT: ${SSH_PORT:-22}
+      SSH_TIMEOUT: ${SSH_TIMEOUT:-6}
+      LEGACY_SSH_FALLBACK: ${LEGACY_SSH_FALLBACK:-1}
+      SSH_USER: ${SSH_USER:-}
+      SSH_PASS: ${SSH_PASS:-}
+      SSH_CREDENTIALS_JSON: ${SSH_CREDENTIALS_JSON:-[]}
+      API_PORT: ${API_PORT:-8728}
+      API_TIMEOUT: ${API_TIMEOUT:-4}
+      API_USE_SSL: "0"
+      SNMP_ENABLED: ${SNMP_ENABLED:-1}
+      SNMP_VERSION: ${SNMP_VERSION:-2c}
+      SNMP_PORT: ${SNMP_PORT:-161}
+      SNMP_TIMEOUT: ${SNMP_TIMEOUT:-2.5}
+      SNMP_RETRIES: ${SNMP_RETRIES:-1}
+      SNMP_COMMUNITY: ${SNMP_COMMUNITY:-ngstehwl}
+      RETENTION_HOURS: ${RETENTION_HOURS:-24}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      BACKUP_DIR: ${BACKUP_DIR:-/app/backups}
+      DASHBOARD_USER: ${DASHBOARD_USER:-admin}
+      DASHBOARD_PASS: ${DASHBOARD_PASS:-change-me}
+    volumes:
+      - db_data:/app/data
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./images:/app/images:ro
+
+volumes:
+  db_data:
