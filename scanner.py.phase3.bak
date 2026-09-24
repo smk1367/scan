@@ -71,13 +71,6 @@ IF_OIDS = {
     "out_errors": "1.3.6.1.2.1.2.2.1.20",
 }
 
-MIMOSA_ROOT = "1.3.6.1.4.1.43356"
-MIMOSA_GENERAL_ROOT = "1.3.6.1.4.1.43356.2.1.2.1"
-MIMOSA_LOC_ROOT = "1.3.6.1.4.1.43356.2.1.2.2"
-MIMOSA_RF_ROOT = "1.3.6.1.4.1.43356.2.1.2.6"
-MIMOSA_CHAIN_ROOT = "1.3.6.1.4.1.43356.2.1.2.6.1.1"
-MIMOSA_PERF_ROOT = "1.3.6.1.4.1.43356.2.1.2.7"
-
 # Proprietary vendor roots used only after standard SNMP identifies the device.
 MIMOSA_ROOT = "1.3.6.1.4.1.43356.2.1.2"
 MIMOSA_CHAIN_ROOT = "1.3.6.1.4.1.43356.2.1.2.6.1.1"
@@ -302,95 +295,41 @@ def avg_values(rows: list[float]) -> float | None:
 
 
 def parse_mimosa_vendor(data: dict[str, str]) -> dict[str, Any]:
-    out={"mimosa_snmp":data,"mimosa_chains":[]}
-    general=MIMOSA_GENERAL_ROOT.lstrip(".")
-    loc=MIMOSA_LOC_ROOT.lstrip(".")
-    rf=MIMOSA_RF_ROOT.lstrip(".")
-    chain=MIMOSA_CHAIN_ROOT.lstrip(".")
-    perf=MIMOSA_PERF_ROOT.lstrip(".")
-
-    def val(root,suffix):
-        return data.get(root+"."+suffix)
-
-    v=val(general,"1");
-    if s(v): out["mimosa_device_name"]=s(v);out["hostname"]=s(v)
-    v=val(general,"2");
-    if s(v): out["serial_number"]=s(v)
-    v=val(general,"3");
-    if s(v): out["firmware_version"]=s(v)
-    v=val(general,"4");
-    if s(v): out["firmware_build_date"]=s(v)
-    v=val(general,"5");
-    if s(v): out["last_reboot_time"]=s(v)
-    v=mimosa_decimal_one(val(general,"8"));
-    if v is not None: out["temperature"]=f"{v:g} C"
-
-    v=mimosa_decimal_five(val(loc,"1"));
-    if v is not None: out["longitude"]=f"{v:g}"
-    v=mimosa_decimal_five(val(loc,"2"));
-    if v is not None: out["latitude"]=f"{v:g}"
-    v=numeric_value(val(loc,"3"));
-    if v is not None: out["altitude"]=f"{v:g} m"
-    v=mimosa_decimal_one(val(loc,"4"));
-    if v is not None: out["gps_snr"]=f"{v:g} dB"
-    v=numeric_value(val(loc,"6"));
-    if v is not None: out["gps_satellites"]=f"{v:g}"
-    v=numeric_value(val(loc,"7"));
-    if v is not None: out["glonass_satellites"]=f"{v:g}"
-
-    v=numeric_value(val(rf,"4"));
-    if v is not None: out["antenna_gain"]=f"{v:g} dBi"
-    v=mimosa_decimal_one(val(rf,"5"));
-    if v is not None: out["total_tx_power"]=f"{v:g} dBm"
-    v=mimosa_decimal_one(val(rf,"6"));
-    if v is not None: out["total_rx_power"]=f"{v:g} dBm"
-    v=numeric_value(val(rf,"7"));
-    if v is not None: out["target_signal_strength"]=f"{v:g} dB"
-
-    tx=[];rx=[];noise=[];snr=[];freq=[];pol=[]
-    for oid,raw in data.items():
-        if not oid.startswith(chain+"."): continue
-        parts=oid[len(chain)+1:].split(".")
-        if len(parts)<2: continue
-        try:col=int(parts[0]);idx=int(parts[1])
-        except Exception:continue
-        row=next((x for x in out["mimosa_chains"] if x.get("index")==idx),None)
-        if row is None:
-            row={"index":idx};out["mimosa_chains"].append(row)
+    out: dict[str, Any] = {"mimosa_chains": []}
+    chain_tx=[]; chain_rx=[]; chain_noise=[]; chain_snr=[]; chain_freq=[]; chain_pol=[]
+    for oid, raw in data.items():
+        p = oid.split(".")
+        # suffix after ...43356.2.1.2.6.1.1 is column then chain index.
+        marker = ["6", "1", "1"]
+        try:
+            i = next(i for i in range(len(p)-2) if p[i:i+3] == marker)
+            col = int(p[i+3]); idx = int(p[i+4]) if len(p) > i+4 else 0
+        except Exception:
+            continue
         v=numeric_value(raw)
-        if col==1: row["chain"]=s(raw)
-        elif col==2 and v is not None:
-            v/=10;row["tx_power"]=f"{v:g} dBm";tx.append(v)
-        elif col==3 and v is not None:
-            v/=10;row["rx_power"]=f"{v:g} dBm";rx.append(v)
-        elif col==4 and v is not None:
-            v/=10;row["noise_floor"]=f"{v:g} dBm";noise.append(v)
-        elif col==5 and v is not None:
-            v/=10;row["snr"]=f"{v:g} dB";snr.append(v)
-        elif col==6 and v is not None:
-            row["frequency"]=f"{v:g} MHz";freq.append(v)
-        elif col==7 and s(raw):
-            row["polarization"]=s(raw);pol.append(s(raw))
-
-    if tx:out["tx_power"]=f"{sum(tx)/len(tx):g} dBm"
-    if rx:out["rx_power"]=f"{sum(rx)/len(rx):g} dBm";out["signal_strength"]=out["rx_power"]
-    if noise:out["noise_floor"]=f"{sum(noise)/len(noise):g} dBm"
-    if snr:out["snr"]=f"{sum(snr)/len(snr):g} dB"
-    if freq:out["frequency"]=f"{sum(freq)/len(freq):g} MHz"
-    if pol:out["polarization"]=pol[0]
-
-    v=numeric_value(val(perf,"1"));
-    if v is not None:out["tx_rate"]=f"{v/1000:g} Mbps"
-    v=numeric_value(val(perf,"2"));
-    if v is not None:out["rx_rate"]=f"{v/1000:g} Mbps"
-    v=mimosa_decimal_two(val(perf,"3"));
-    if v is not None:out["tx_per"]=f"{v:g}%"
-    v=mimosa_decimal_two(val(perf,"4"));
-    if v is not None:out["rx_per"]=f"{v:g}%"
-
+        # Mimosa dBm1 values are reported in tenths of a dB in the SNMP MIB.
+        # Keep frequency unchanged; scale power/noise/SNR to real dashboard units.
+        if v is not None and col in {2,3,4,5}:
+            v = v / 10.0
+        row={"index":idx}
+        if col==2 and v is not None: row["tx_power"]=f"{v:g} dBm"; chain_tx.append(v)
+        elif col==3 and v is not None: row["rx_power"]=f"{v:g} dBm"; chain_rx.append(v)
+        elif col==4 and v is not None: row["noise_floor"]=f"{v:g} dBm"; chain_noise.append(v)
+        elif col==5 and v is not None: row["snr"]=f"{v:g} dB"; chain_snr.append(v)
+        elif col==6 and v is not None: row["frequency"]=f"{v:g} MHz"; chain_freq.append(v)
+        elif col==7 and s(raw): row["polarization"]=s(raw)
+        if len(row)>1:
+            old=next((x for x in out["mimosa_chains"] if x["index"]==idx),None)
+            if old: old.update(row)
+            else: out["mimosa_chains"].append(row)
+    tx=avg_values(chain_tx);rx=avg_values(chain_rx);nf=avg_values(chain_noise);snr=avg_values(chain_snr);freq=avg_values(chain_freq)
+    if tx is not None: out["tx_power"]=f"{tx:g} dBm"
+    if rx is not None: out["rx_power"]=f"{rx:g} dBm";out["signal_strength"]=out["rx_power"]
+    if nf is not None: out["noise_floor"]=f"{nf:g} dBm"
+    if snr is not None: out["snr"]=f"{snr:g} dB"
+    if freq is not None: out["frequency"]=f"{freq:g} MHz"
     if out["mimosa_chains"]:
         out["antenna_count"]=len(out["mimosa_chains"])
-        out["chain_summary"]=json.dumps(out["mimosa_chains"],ensure_ascii=False)
     return out
 
 
@@ -438,24 +377,180 @@ def parse_racom_vendor(data: dict[str, str]) -> dict[str, Any]:
 def snmp_vendor_collect(ip: str, city: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
     community=s(base.get("snmp_community"))
     vendor=s(base.get("vendor"))
-    if not community:return {}
+    if not community or not vendor:
+        return {}
     try:
-        if vendor=="Mimosa" or not vendor:
-            raw=snmpbulkwalk_numeric(ip,community,MIMOSA_ROOT,city)
-            if raw:
-                parsed=parse_mimosa_vendor(raw)
-                if parsed:
-                    parsed["vendor"]="Mimosa"
-                    parsed["device_type"]="Mimosa"
-                    return parsed
-        if vendor=="Racom":
+        if vendor == "Mimosa":
+            raw=snmpbulkwalk_numeric(ip,community,MIMOSA_CHAIN_ROOT,city)
+            return parse_mimosa_vendor(raw) if raw else {}
+        if vendor == "Racom":
             raw={}
             for root in (RACOM_DEVICE_ROOT,RACOM_RADIO_ROOT,RACOM_WATCHED_ROOT):
                 raw.update(snmpbulkwalk_numeric(ip,community,root,city))
             return parse_racom_vendor(raw) if raw else {}
     except Exception as exc:
-        LOG.debug("Vendor SNMP normalize %s failed: %s",ip,exc)
+        LOG.debug("Vendor SNMP normalize %s failed: %s", ip, exc)
     return {}
+
+
+def precheck(ip: str, city: dict[str, Any]) -> list[str]:
+    reasons=[]
+    # SNMP is UDP. Do not TCP-probe port 161: a valid SNMP-only device
+    # would otherwise be incorrectly classified as "not_alive".
+    # IMPORTANT: never probe/use RouterOS API SSL 8729.
+    if int(city.get("api_enabled", 1)) and int(city.get("api_ssl_enabled", 0)) == 0 and tcp_open(ip, city["api_port"]):
+        reasons.append(f"API {city['api_port']}")
+    if tcp_open(ip, city["ssh_port"]):
+        reasons.append("SSH")
+    try:
+        rc=subprocess.run(["ping","-c","1","-W","1",ip],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=2).returncode
+        if rc==0: reasons.append("ICMP")
+    except Exception:
+        pass
+    if not reasons:
+        # Only do a direct SNMP UDP check when the faster probes found
+        # nothing. This preserves scan speed on large networks while still
+        # discovering SNMP-only devices.
+        probe,_=snmp_get(ip,city,[STANDARD_OIDS["sysObjectID"]])
+        if probe:
+            reasons.append("SNMP")
+    return reasons
+
+
+def parse_key_value_lines(text: str) -> dict[str, str]:
+    out={}
+    for line in text.replace("\r","").splitlines():
+        m=re.match(r"^\s*([A-Za-z][A-Za-z0-9_.-]*)\s*:\s*(.*?)\s*$",line)
+        if m:out[m.group(1).lower()]=m.group(2).strip()
+    return out
+
+
+def parse_equal_lines(text: str) -> dict[str, str]:
+    out={}
+    for line in text.replace("\r","").splitlines():
+        for m in re.finditer(r'([A-Za-z][A-Za-z0-9_.-]*)\s*=\s*(?:"([^"]*)"|([^\s]+))',line):
+            out[m.group(1).lower()]=m.group(2) if m.group(2) is not None else m.group(3)
+    return out
+
+def routeros_interface_names(text: str) -> list[str]:
+    """Extract interface names from RouterOS print detail/terse output."""
+    names = []
+    for m in re.finditer(r'(?:^|\s)name=(?:"([^"]+)"|([^\s]+))', text, flags=re.MULTILINE):
+        name = (m.group(1) or m.group(2) or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+class LegacySSH:
+    def __init__(self, ip: str, username: str, password: str, port: int): self.ip,self.username,self.password,self.port=ip,username,password,port
+    def exec_command(self, command: str, timeout: float = 8):
+        env=os.environ.copy(); env["SSHPASS"]=self.password
+        opts=["-o","StrictHostKeyChecking=no","-o","UserKnownHostsFile=/dev/null","-o",f"ConnectTimeout={max(1,int(timeout))}","-o","HostKeyAlgorithms=+ssh-rsa,ssh-dss","-o","KexAlgorithms=+diffie-hellman-group1-sha1,diffie-hellman-group14-sha1","-p",str(self.port)]
+        p=subprocess.run(["sshpass","-e","ssh",*opts,f"{self.username}@{self.ip}",command],env=env,text=True,capture_output=True,timeout=max(10,int(timeout)+5))
+        return None, _Out(p.stdout), _Out(p.stderr)
+    def close(self): pass
+class _Out:
+    def __init__(self,x): self.x=x
+    def read(self): return self.x.encode("utf-8","replace")
+
+
+def ssh_connect(ip: str, city: dict[str, Any]):
+    creds,_=city_credentials(city); last=None
+    for cred in creds:
+        try:
+            c=paramiko.SSHClient();c.set_missing_host_key_policy(paramiko.AutoAddPolicy());c.connect(ip,port=int(city["ssh_port"]),username=cred["username"],password=cred["password"],timeout=float(city["ssh_timeout"]),banner_timeout=float(city["ssh_timeout"]),auth_timeout=float(city["ssh_timeout"]),allow_agent=False,look_for_keys=False);return c,f"ssh:{cred['id']}"
+        except Exception as exc:last=exc
+    if os.getenv("LEGACY_SSH_FALLBACK","1").lower() in {"1","true","yes","on"} and shutil.which("sshpass"):
+        for cred in creds:
+            try:
+                c=LegacySSH(ip,cred["username"],cred["password"],int(city["ssh_port"]))
+                _,o,e=c.exec_command("/system identity print",timeout=float(city["ssh_timeout"]));txt=o.read().decode("utf-8","replace").strip()
+                if txt:return c,f"ssh-legacy:{cred['id']}"
+                last=RuntimeError(e.read().decode("utf-8","replace")[:200] or "Legacy SSH failed")
+            except Exception as exc:last=exc
+    raise RuntimeError(str(last or "No SSH credentials"))
+
+
+def ssh_cmd(c, command, timeout=8):
+    try:
+        _,o,_=c.exec_command(command,timeout=timeout);return o.read().decode("utf-8","replace").strip()
+    except Exception:return ""
+
+
+def ssh_mikrotik(c):
+    identity=ssh_cmd(c,"/system identity print"); resource=ssh_cmd(c,"/system resource print"); health=ssh_cmd(c,"/system health print")
+    wireless_cfg=ssh_cmd(c,"/interface wireless print detail without-paging")
+    wireless_api="wireless"
+    if not wireless_cfg:
+        wireless_cfg=ssh_cmd(c,"/interface wifi print detail without-paging")
+        wireless_api="wifi"
+    interface_names=routeros_interface_names(wireless_cfg)
+    wireless_interface=interface_names[0] if interface_names else "wlan1"
+    monitor=ssh_cmd(c,f"/interface {wireless_api} monitor {wireless_interface} once")
+    if not monitor and wireless_api=="wireless":
+        monitor=ssh_cmd(c,f"/interface wifi monitor {wireless_interface} once")
+    elif not monitor and wireless_api=="wifi":
+        monitor=ssh_cmd(c,f"/interface wireless monitor {wireless_interface} once")
+    registration=ssh_cmd(c,f"/interface {wireless_api} registration-table print detail")
+    if not registration and wireless_api=="wireless":
+        registration=ssh_cmd(c,"/interface wifi registration-table print detail")
+    elif not registration and wireless_api=="wifi":
+        registration=ssh_cmd(c,"/interface wireless registration-table print detail")
+    interfaces=ssh_cmd(c,"/interface print detail without-paging")
+    queues=ssh_cmd(c,"/queue simple print detail without-paging")
+    firewall=ssh_cmd(c,"/ip firewall filter print stats without-paging")
+    pppoe=ssh_cmd(c,"/interface pppoe-client print detail without-paging")
+    routes=ssh_cmd(c,"/ip route print detail without-paging")
+    i=parse_equal_lines(identity+"\n"+resource); m=parse_key_value_lines(monitor); w=parse_equal_lines(wireless_cfg)
+    out={"device_type":"MikroTik","vendor":"MikroTik","hostname":i.get("name",""),"model":i.get("board-name","") or i.get("platform",""),"routeros_version":i.get("version",""),"firmware_version":i.get("version",""),"uptime":i.get("uptime",""),"interface_name":wireless_interface,"interfaces":interfaces,"wireless_registration":registration,"queues":queues,"firewall_counters":firewall,"pppoe_vpn":pppoe,"ip_routes":routes,"ssh_status":"success","ssh_raw":{"identity":identity,"resource":resource,"health":health,"monitor":monitor,"registration":registration,"wireless_interface":wireless_interface}}
+    mapping={"ssid":"ssid","channel":"channel","mode":"mode","frequency":"frequency","noise-floor":"noise_floor","signal-strength":"rx_power","tx-signal-strength":"peer_tx_signal","tx-rate":"tx_rate","rx-rate":"rx_rate","radio-name":"radio_name","signal-to-noise":"snr","tx-ccq":"tx_ccq","rx-ccq":"rx_ccq","overall-tx-ccq":"ccq","status":"wireless_status"}
+    for src,dst in mapping.items():
+        if m.get(src):out[dst]=m[src]
+    if not out.get("ssid"):out["ssid"]=w.get("ssid","")
+    if not out.get("mode"):out["mode"]=w.get("mode","")
+    if out.get("rx_power"):out["rx_power"]=normdbm(out["rx_power"]);out["signal_strength"]=out["rx_power"]
+    if out.get("peer_tx_signal"):out["peer_tx_signal"]=normdbm(out["peer_tx_signal"])
+    if out.get("noise_floor"):out["noise_floor"]=normdbm(out["noise_floor"])
+    ch=s(out.get("channel")); mm=re.match(r"^(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)",ch)
+    if mm:out["frequency"]=mm.group(1);out["bandwidth"]=mm.group(2)+" MHz"
+    out["mac_address"]=w.get("mac-address","")
+    return out
+
+
+def merge_nonempty(dst: dict[str, Any], src: dict[str, Any], preserve: set[str] | None = None):
+    preserve=preserve or set()
+    for k,v in src.items():
+        if k in preserve:continue
+        if s(v):dst[k]=v
+
+
+def normalize_api_data(api: dict[str, Any]) -> dict[str, Any]:
+    """Flatten RouterOS API runtime radio/topology into dashboard fields."""
+    out={}
+    radio=api.get("radio") or {}
+    if isinstance(radio,dict):
+        mapping={
+            "ssid":"ssid","frequency":"frequency","channel":"channel","channel-width":"bandwidth","bandwidth":"bandwidth",
+            "mode":"mode","signal-strength":"rx_power","tx-signal-strength":"peer_tx_signal","tx-rate":"tx_rate","rx-rate":"rx_rate",
+            "signal-to-noise":"snr","noise-floor":"noise_floor","tx-ccq":"tx_ccq","rx-ccq":"rx_ccq","overall-tx-ccq":"ccq",
+            "radio-name":"radio_name","status":"wireless_status"
+        }
+        for src,dst in mapping.items():
+            if s(radio.get(src)):out[dst]=radio[src]
+        if out.get("rx_power"):out["rx_power"]=normdbm(out["rx_power"]);out["signal_strength"]=out["rx_power"]
+        if out.get("peer_tx_signal"):out["peer_tx_signal"]=normdbm(out["peer_tx_signal"])
+        if out.get("noise_floor"):out["noise_floor"]=normdbm(out["noise_floor"])
+    wireless=api.get("api_menus",{}).get("wireless") or []
+    if isinstance(wireless,list) and wireless:wireless=wireless[0]
+    if isinstance(wireless,dict):
+        for src,dst in (("ssid","ssid"),("channel","channel"),("frequency","frequency"),("channel-width","bandwidth"),("mode","mode"),("antenna-gain","antenna_gain"),("polarization","polarization"),("tx-power","tx_power"),("mac-address","mac_address")):
+            if not s(out.get(dst)) and s(wireless.get(src)):out[dst]=wireless[src]
+    menus=api.get("api_menus",{})
+    for key,dst in (("registration","wireless_registration"),("interfaces","interfaces"),("queues","queues"),("firewall_filter","firewall_counters"),("pppoe","pppoe_vpn"),("routes","ip_routes"),("bridges","bridges")):
+        val=menus.get(key)
+        if val:out[dst]=json.dumps(val,ensure_ascii=False,default=str)
+    return out
 
 
 def scan_one(item: dict[str, Any]) -> dict[str, Any]:
@@ -464,22 +559,11 @@ def scan_one(item: dict[str, Any]) -> dict[str, Any]:
     checks=precheck(ip,city); result["precheck"]=checks
     if not checks:result.update(status="not_alive",reason="No response on SNMP/API/SSH/ICMP");return result
     before=get_device(ip);data={"ip_address":ip,"city_id":city["id"],"city":city["name"],"scan_status":"success"}
-    sn=snmp_collect(ip,city)
-    merge_nonempty(data,{k:v for k,v in sn.items() if k not in {"snmp_raw","snmp_community","snmp_vendor_raw"}})
-    if not data.get("device_type"):
-        try:
-            direct_vendor=snmp_vendor_collect(ip,city,{"snmp_community":sn.get("snmp_community")})
-        except Exception:
-            direct_vendor={}
-        if direct_vendor:
-            merge_nonempty(data,direct_vendor,preserve={"mimosa_snmp","mimosa_chains","racom_snmp"})
-            data["device_type"]=direct_vendor.get("device_type") or direct_vendor.get("vendor")
-            data["vendor"]=direct_vendor.get("vendor") or data.get("device_type")
-            data["snmp_vendor_raw"]=direct_vendor.get("mimosa_snmp") or direct_vendor.get("racom_snmp") or direct_vendor
-    snmp_only_vendor=data.get("device_type") in {"Mimosa","Racom"} or data.get("vendor") in {"Mimosa","Racom"}
+    sn=snmp_collect(ip,city);merge_nonempty(data,{k:v for k,v in sn.items() if k not in {"snmp_raw","snmp_community"}})
     api_data={}
-    # RouterOS API is for MikroTik; Mimosa/Racom are SNMP-only.
-    if (not snmp_only_vendor) and int(city.get("api_enabled",1)) and int(city.get("api_ssl_enabled",0))==0:
+    # Try plain RouterOS API when enabled. A successful API login can
+    # identify MikroTik even when SNMP is unavailable. API-SSL is never used.
+    if int(city.get("api_enabled",1)) and int(city.get("api_ssl_enabled",0))==0:
         creds,_=city_credentials(city)
         for cred in creds:
             ac=None
@@ -497,12 +581,7 @@ def scan_one(item: dict[str, Any]) -> dict[str, Any]:
     elif data.get("device_type")=="MikroTik":
         data["api_status"]="disabled"
     ssh_data={}
-    if snmp_only_vendor:
-        data["api_status"]="not_used_snmp_only"
-        data["ssh_status"]="not_used_snmp_only"
     try:
-        if snmp_only_vendor:
-            raise RuntimeError("SNMP-only vendor")
         c,method=ssh_connect(ip,city)
         try:
             identity_probe=ssh_cmd(c,"/system identity print")
@@ -519,13 +598,7 @@ def scan_one(item: dict[str, Any]) -> dict[str, Any]:
         # For MikroTik, wireless rates/signals from SSH are the requested fallback when API monitor is absent.
     except Exception as exc:data["ssh_status"]=f"failed: {str(exc)[:180]}"
     data["raw_data"]=json.dumps({"snmp":sn,"api":api_data,"ssh":ssh_data},ensure_ascii=False,default=str)
-    protocol_ok = (
-        sn.get("snmp_status") == "success"
-        or bool(data.get("snmp_vendor_raw"))
-        or data.get("device_type") in {"Mimosa","Racom"}
-        or data.get("api_status") == "success"
-        or data.get("ssh_status") == "success"
-    )
+    protocol_ok = sn.get("snmp_status") == "success" or data.get("api_status") == "success" or data.get("ssh_status") == "success"
     if not protocol_ok:
         failed_reasons=[]
         if sn.get("snmp_status") != "success": failed_reasons.append("SNMP failed")
@@ -538,49 +611,19 @@ def scan_one(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def targets(city_ids: list[int] | None=None):
-    cities=[c for c in list_cities() if c["enabled"]]
-    selected=set(city_ids or [])
-    if selected:
-        cities=[c for c in cities if c["id"] in selected]
-    out=[];seen=set();city_map={int(c["id"]):c for c in cities}
-    all_city_map={int(c["id"]):c for c in list_cities()}
+    cities=[c for c in list_cities() if c["enabled"]]; selected=set(city_ids or [])
+    if selected:cities=[c for c in cities if c["id"] in selected]
+    out=[];seen=set()
     for city in cities:
         try:
             for ip in ipaddress.ip_network(city["cidr"],strict=False).hosts():
                 sip=str(ip)
-                if sip not in seen:
-                    seen.add(sip);out.append({"ip_address":sip,"city":city})
-        except Exception:
-            continue
-
-    # Manual IPs: explicit city assignment wins; otherwise resolve by CIDR.
+                if sip not in seen:seen.add(sip);out.append({"ip_address":sip,"city":city})
+        except Exception:continue
+    # Manual IPs use legacy/global credentials and ports.
     for m in list_manual_ips():
-        if not m["enabled"] or m["ip_address"] in seen:
-            continue
-        assigned=all_city_map.get(int(m["city_id"])) if m.get("city_id") not in (None,"") else None
-        if assigned is None:
-            try:
-                obj=ipaddress.ip_address(m["ip_address"])
-                for city in cities:
-                    if obj in ipaddress.ip_network(city["cidr"],strict=False):
-                        assigned=city;break
-                if assigned is None:
-                    for city in list_cities():
-                        if obj in ipaddress.ip_network(city["cidr"],strict=False):
-                            assigned=city;break
-            except Exception:
-                assigned=None
-        if assigned is not None:
-            out.append({"ip_address":m["ip_address"],"city":assigned});seen.add(m["ip_address"])
-        else:
-            out.append({"ip_address":m["ip_address"],"city":{"id":None,"name":"Manual","enabled":1,
-                "ssh_port":int(os.getenv("SSH_PORT","22")),"snmp_port":int(os.getenv("SNMP_PORT","161")),
-                "api_port":int(os.getenv("API_PORT","8728")),"api_enabled":1,"api_ssl_enabled":0,
-                "api_timeout":float(os.getenv("API_TIMEOUT","4")),"snmp_timeout":float(os.getenv("SNMP_TIMEOUT","2.5")),
-                "snmp_retries":int(os.getenv("SNMP_RETRIES","1")),"ssh_timeout":float(os.getenv("SSH_TIMEOUT","6")),
-                "ssh_credentials_json":os.getenv("SSH_CREDENTIALS_JSON","[]"),
-                "snmp_communities_json":json.dumps([os.getenv("SNMP_COMMUNITY","ngstehwl")])}})
-            seen.add(m["ip_address"])
+        if not m["enabled"] or m["ip_address"] in seen:continue
+        seen.add(m["ip_address"]);out.append({"ip_address":m["ip_address"],"city":{"id":None,"name":"Manual","enabled":1,"ssh_port":int(os.getenv("SSH_PORT","22")),"snmp_port":int(os.getenv("SNMP_PORT","161")),"api_port":int(os.getenv("API_PORT","8728")),"api_enabled":1,"api_ssl_enabled":0,"api_timeout":float(os.getenv("API_TIMEOUT","4")),"snmp_timeout":float(os.getenv("SNMP_TIMEOUT","2.5")),"snmp_retries":int(os.getenv("SNMP_RETRIES","1")),"ssh_timeout":float(os.getenv("SSH_TIMEOUT","6")),"ssh_credentials_json":os.getenv("SSH_CREDENTIALS_JSON","[]"),"snmp_communities_json":json.dumps([os.getenv("SNMP_COMMUNITY","ngstehwl")])}})
     return out
 
 

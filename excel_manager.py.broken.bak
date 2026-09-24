@@ -168,10 +168,11 @@ def import_excel(fileobj,db_path,mode="devices"):
                             value=text(row[mp[eff]])
                             sets += [f"{man}=?",f"{eff}=?"];args += [value,value]
                     if sets:
-                        sets.append("last_updated=?");args += [datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
-                        args.append(ip)
+                        sets.append("last_updated=?");args += [datetime.now().strftime("%Y-%m-%d %H:%M:%S"),ip]
                         conn.execute(f"UPDATE devices SET {','.join(sets)} WHERE ip_address=?",args);count+=1
                 conn.commit();return {"status":"ok","updated":count,"not_found":len(not_found),"not_found_ips":not_found}
+
+        try:
             if mode=="blacklist":
                 p={"entry":pos.get("entry",pos.get("ip",pos.get("ip address"))),"description":pos.get("description"),"enabled":pos.get("enabled")};count=0
                 if p["entry"] is None:raise ValueError("ستون Entry در Excel وجود ندارد")

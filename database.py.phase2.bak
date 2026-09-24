@@ -149,7 +149,6 @@ CREATE TABLE IF NOT EXISTS blacklist (
 CREATE TABLE IF NOT EXISTS manual_ips (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ip_address TEXT UNIQUE NOT NULL,
-    city_id INTEGER,
     description TEXT DEFAULT '',
     enabled INTEGER DEFAULT 1,
     created_at TEXT NOT NULL
@@ -224,7 +223,6 @@ def init_db() -> None:
             "polarization", "capacity", "manual_latitude", "manual_longitude", "manual_province",
             "manual_city", "manual_antenna_gain", "manual_polarization", "manual_capacity"
         )})
-        _ensure_columns(c, "manual_ips", {"city_id": "INTEGER"})
         _ensure_columns(c, "cities", {
             "ssh_port": "INTEGER DEFAULT 22", "snmp_port": "INTEGER DEFAULT 161", "api_port": "INTEGER DEFAULT 8728",
             "api_enabled": "INTEGER DEFAULT 1", "api_ssl_enabled": "INTEGER DEFAULT 0", "api_timeout": "REAL DEFAULT 4",
@@ -277,10 +275,7 @@ def get_devices(search: str = "", city_id: int | None = None, online_only: bool 
             q=f"%{search}%"; where.append("(d.ip_address LIKE ? OR d.hostname LIKE ? OR d.ssid LIKE ? OR d.model LIKE ? OR d.vendor LIKE ? OR d.device_type LIKE ?)"); args += [q]*6
         where.append("NOT EXISTS(SELECT 1 FROM blacklist b WHERE b.enabled=1 AND b.entry=d.ip_address)")
         rows=c.execute(f"SELECT d.* FROM devices d WHERE {' AND '.join(where)} ORDER BY d.ip_address",args).fetchall()
-        result=[dict(r) for r in rows]
-        # Manual IP targets are materialized in devices by add_manual_ip(); the
-        # query above therefore remains the single source for the dashboard.
-        return result
+        return [dict(r) for r in rows]
     finally:c.close()
 
 
@@ -402,63 +397,12 @@ def is_blacklisted(ip):
     return False
 
 def list_manual_ips():
-    c=connect()
-    try:
-        rows=c.execute("""SELECT m.*,c.name AS city_name,c.cidr AS city_cidr
-                         FROM manual_ips m LEFT JOIN cities c ON c.id=m.city_id
-                         ORDER BY m.ip_address""").fetchall()
-        return [dict(x) for x in rows]
+    c=connect();r=[dict(x) for x in c.execute("SELECT * FROM manual_ips ORDER BY ip_address")];c.close();return r
+
+def add_manual_ip(ip,description=""):
+    from ipaddress import ip_address;ip_address(ip);c=connect()
+    try:cur=c.execute("INSERT INTO manual_ips(ip_address,description,created_at) VALUES(?,?,?)",(ip.strip(),description.strip(),now()));c.commit();return dict(c.execute("SELECT * FROM manual_ips WHERE id=?",(cur.lastrowid,)).fetchone())
     finally:c.close()
-
-
-def add_manual_ip(ip,description="",city_id=None):
-    from ipaddress import ip_address,ip_network
-    ip=str(ip_address(ip));c=connect()
-    try:
-        selected_city_id=int(city_id) if city_id not in (None,"") else None
-        matched=None
-        if selected_city_id is not None:
-            row=c.execute("SELECT * FROM cities WHERE id=? AND enabled=1",(selected_city_id,)).fetchone()
-            if not row:
-                raise ValueError("شهر انتخاب‌شده معتبر نیست")
-            matched=dict(row)
-        else:
-            for row in c.execute("SELECT * FROM cities WHERE enabled=1 ORDER BY id").fetchall():
-                try:
-                    if ip_address(ip) in ip_network(row["cidr"],strict=False):
-                        matched=dict(row)
-                        selected_city_id=int(row["id"])
-                        break
-                except Exception:
-                    continue
-
-        cur=c.execute("""INSERT INTO manual_ips(ip_address,city_id,description,enabled,created_at)
-                        VALUES(?,?,?,?,?)
-                        ON CONFLICT(ip_address) DO UPDATE SET
-                          city_id=excluded.city_id,
-                          description=excluded.description,
-                          enabled=1""",
-                       (ip,selected_city_id,description.strip(),1,now()))
-
-        if matched:
-            c.execute("""INSERT INTO devices(ip_address,city_id,city,scan_status,last_updated)
-                        VALUES(?,?,?,?,?)
-                        ON CONFLICT(ip_address) DO UPDATE SET
-                          city_id=excluded.city_id,
-                          city=CASE
-                                 WHEN COALESCE(devices.city,'') IN ('','Manual') THEN excluded.city
-                                 ELSE devices.city
-                               END""",
-                       (ip,matched["id"],matched["name"],"manual_pending",now()))
-        else:
-            c.execute("""INSERT INTO devices(ip_address,city_id,city,scan_status,last_updated)
-                        VALUES(?,?,?,?,?)
-                        ON CONFLICT(ip_address) DO NOTHING""",
-                       (ip,None,"Manual","manual_pending",now()))
-        c.commit()
-        return dict(c.execute("SELECT * FROM manual_ips WHERE ip_address=?",(ip,)).fetchone())
-    finally:c.close()
-
 
 def delete_manual_ip(i):
     c=connect();n=c.execute("DELETE FROM manual_ips WHERE id=?",(i,)).rowcount;c.commit();c.close();return bool(n)
@@ -518,46 +462,14 @@ def get_setting(key,default=''):
 def set_setting(key,value):
     c=connect();c.execute('INSERT INTO app_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,str(value)));c.commit();c.close()
 
-def get_city_counts():
-    c=connect()
-    try:
-        rows=c.execute("""SELECT c.id,c.name,c.cidr,
-                COUNT(DISTINCT d.id) AS total,
-                COUNT(DISTINCT CASE WHEN d.scan_status='success' THEN d.id END) AS online
-            FROM cities c
-            LEFT JOIN devices d ON d.city_id=c.id
-            WHERE c.enabled=1
-              AND NOT EXISTS(SELECT 1 FROM blacklist b WHERE b.enabled=1 AND b.entry=d.ip_address)
-            GROUP BY c.id,c.name,c.cidr ORDER BY c.name""").fetchall()
-        return [dict(x) for x in rows]
-    finally:c.close()
-
 def get_stats():
     c=connect()
     try:
         total=c.execute("SELECT COUNT(*) FROM devices d WHERE NOT EXISTS(SELECT 1 FROM blacklist b WHERE b.enabled=1 AND b.entry=d.ip_address)").fetchone()[0]
         online=c.execute("SELECT COUNT(*) FROM devices d WHERE d.scan_status='success' AND NOT EXISTS(SELECT 1 FROM blacklist b WHERE b.enabled=1 AND b.entry=d.ip_address)").fetchone()[0]
-        cities=[dict(x) for x in c.execute("""
-            SELECT c.id,c.name,c.cidr,
-                   COUNT(DISTINCT d.id) total,
-                   COUNT(DISTINCT CASE WHEN d.scan_status='success' THEN d.id END) online
-            FROM cities c
-            LEFT JOIN devices d
-              ON (d.city_id=c.id OR d.city=c.name OR d.manual_city=c.name)
-             AND NOT EXISTS(SELECT 1 FROM blacklist b WHERE b.enabled=1 AND b.entry=d.ip_address)
-            GROUP BY c.id ORDER BY c.name
-        """)]
-        province_rows=c.execute("""
-            SELECT COALESCE(NULLIF(d.manual_province,''),NULLIF(d.province,''),NULLIF(d.city,''),'نامشخص') province,
-                   COUNT(DISTINCT d.id) total,
-                   COUNT(DISTINCT CASE WHEN d.scan_status='success' THEN d.id END) online
-            FROM devices d
-            WHERE NOT EXISTS(SELECT 1 FROM blacklist b WHERE b.enabled=1 AND b.entry=d.ip_address)
-            GROUP BY COALESCE(NULLIF(d.manual_province,''),NULLIF(d.province,''),NULLIF(d.city,''),'نامشخص')
-            ORDER BY province
-        """).fetchall()
+        cities=[dict(x) for x in c.execute("SELECT c.id,c.name,c.cidr,COUNT(d.id) total,SUM(CASE WHEN d.scan_status='success' THEN 1 ELSE 0 END) online FROM cities c LEFT JOIN devices d ON d.city_id=c.id GROUP BY c.id ORDER BY c.name")]
         last=c.execute('SELECT * FROM scan_logs ORDER BY id DESC LIMIT 1').fetchone()
-        return {'total_devices':total,'online_devices':online,'cities':cities,'provinces':[dict(x) for x in province_rows],'last_scan':dict(last) if last else None}
+        return {'total_devices':total,'online_devices':online,'cities':cities,'last_scan':dict(last) if last else None}
     finally:c.close()
 
 def list_users():

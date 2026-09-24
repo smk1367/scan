@@ -11,7 +11,6 @@ RUN apt-get update \
         openssh-client \
         sshpass \
         iputils-ping \
-        snmp \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

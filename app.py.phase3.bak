@@ -122,12 +122,7 @@ def device_manual(ip):
 
 @app.get("/api/cities")
 @auth
-def cities():
-    rows=db.list_cities();stats={str(x["id"]):x for x in db.get_city_counts()}
-    for row in rows:
-        row.update(stats.get(str(row["id"]),{"total":0,"online":0}))
-    return jsonify(rows)
-
+def cities():return jsonify(db.list_cities())
 @app.post("/api/cities")
 @auth
 @full
@@ -209,7 +204,7 @@ def mi_get():return jsonify(db.list_manual_ips())
 @full
 def mi_add():
     x=request.get_json(silent=True) or {}
-    try:return jsonify(db.add_manual_ip(x.get("ip_address","").strip(),x.get("description","").strip(),x.get("city_id"))),201
+    try:return jsonify(db.add_manual_ip(x.get("ip_address","").strip(),x.get("description","").strip())),201
     except Exception as e:return jsonify(error="invalid_ip",message=str(e)),400
 @app.delete("/api/manual-ips/<int:i>")
 @auth
@@ -251,26 +246,6 @@ def users_del(i):
     return jsonify(status="deleted") if db.delete_user(i) else (jsonify(error="not_found"),404)
 
 # Excel: devices/history plus current/historical sheets.
-@app.get("/api/excel/antenna")
-@auth
-@full
-def excel_antenna_export():
-    city_id=request.args.get("city_id")
-    try: city_id=int(city_id) if city_id not in (None,"") else None
-    except: city_id=None
-    data=export_excel(DB_PATH,mode="antenna",city_id=city_id)
-    suffix=f"city_{city_id}" if city_id is not None else "all_cities"
-    return send_file(data,as_attachment=True,download_name=f"antenna_{suffix}.xlsx",mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-@app.post("/api/excel/antenna")
-@auth
-@full
-def excel_antenna_import():
-    f=request.files.get("file")
-    if not f:return jsonify(error="file_required"),400
-    try:return jsonify(import_excel(f.stream,DB_PATH,"antenna"))
-    except Exception as e:return jsonify(error="antenna_excel_failed",message=str(e)),400
-
 @app.get("/api/excel/wireless")
 @auth
 def excel_wireless_export():
@@ -289,15 +264,6 @@ def excel_wireless_export():
     data=export_excel(DB_PATH,hours=hours,mode="wireless",city_id=city_id,ip_address=ip)
     suffix=(f"{city_id}" if city_id is not None else (ip.replace('.','_') if ip else "all"))
     return send_file(data,as_attachment=True,download_name=f"wireless_{suffix}_{hours or 'all'}h.xlsx",mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-@app.get("/api/excel/view-full")
-@auth
-def excel_view_full():
-    hours=request.args.get("hours","all")
-    try: hours=None if hours=="all" else int(hours)
-    except: hours=None
-    data=export_excel(DB_PATH,hours=hours,mode="view_full")
-    return send_file(data,as_attachment=True,download_name=f"wireless_monitor_view_{hours or 'all'}h.xlsx",mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 @app.get("/api/excel/export")
 @auth
