@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Excel import/export for devices, blacklist, manual radios and time-range backups."""
 from __future__ import annotations
-import io, ipaddress, json, re, sqlite3
+import io, ipaddress, json, sqlite3
 from datetime import datetime, timedelta
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -28,34 +28,6 @@ def add_sheet(wb,title,headers,rows):
     ws=wb.create_sheet(title);ws.append(headers)
     for row in rows:ws.append([row.get(h,"") if isinstance(row,dict) else row[i] for i,h in enumerate(headers)])
     sheet_style(ws);return ws
-
-def city_sheet_title(name,used):
-    raw=text(name).strip() or "نامشخص"
-    raw=re.sub(r'[\[\]:\*\?/\\]', '_', raw)
-    raw=raw[:31] or "Sheet"
-    base=raw
-    n=2
-    while raw in used:
-        suffix=f" ({n})"
-        raw=(base[:31-len(suffix)]+suffix) or f"Sheet{n}"
-        n+=1
-    used.add(raw)
-    return raw
-
-
-def add_city_sheets(wb,conn,rows):
-    by_city={}
-    for row in rows:
-        city=text(row.get("City") or "").strip() or "نامشخص"
-        by_city.setdefault(city,[]).append(row)
-    used=set()
-    city_rows=conn.execute("SELECT name FROM cities WHERE enabled=1 ORDER BY name").fetchall()
-    for row in city_rows:
-        city=text(row[0]).strip() or "نامشخص"
-        add_sheet(wb,city_sheet_title(city,used),VIEW_HEADERS,by_city.pop(city,[]))
-    for city,items in by_city.items():
-        add_sheet(wb,city_sheet_title(city,used),VIEW_HEADERS,items)
-
 
 def json_load(v):
     if not v:return {}
@@ -127,10 +99,6 @@ def export_excel(db_path, hours=None, mode="full", city_id=None, ip_address=None
                        d.ssh_status AS SSH,d.last_seen AS 'Last Seen',d.scan_status AS Status
                 FROM devices d WHERE %s ORDER BY d.city,d.ip_address
             """ % " AND ".join(where),args)]
-            # Keep the existing Devices/Wireless sheets, but prepend one
-            # worksheet for every active city so Tehran, Pardis, ... are each
-            # separate tabs in the same order used by the dashboard city list.
-            add_city_sheets(wb,conn,rows)
             add_sheet(wb,"Devices",VIEW_HEADERS,rows)
             wireless=[dict(r) for r in conn.execute("""
                 SELECT d.ip_address AS IP,d.city AS City,d.vendor AS Vendor,d.device_type AS Type,d.hostname AS Hostname,

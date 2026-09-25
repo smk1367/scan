@@ -303,23 +303,6 @@ def upsert_device(data: dict[str, Any]) -> dict[str, Any]:
         vals=[j(data.get(f,"")) for f in fields]
         sql=f"INSERT INTO devices({','.join(fields)}) VALUES({','.join('?' for _ in fields)}) ON CONFLICT(ip_address) DO UPDATE SET "+','.join(f"{f}=excluded.{f}" for f in fields if f!='ip_address')
         c.execute(sql,vals)
-
-        # Manual targets keep an entered value when a subsequent scan returns
-        # that field empty. This is intentionally scoped to manual IPs only.
-        manual_target=c.execute("SELECT 1 FROM manual_ips WHERE ip_address=? AND enabled=1",(ip,)).fetchone()
-        if manual_target:
-            preserve_fields=(
-                "device_type","vendor","hostname","model","routeros_version","firmware_version","serial_number","mac_address",
-                "ssid","frequency","channel","bandwidth","mode","radio_name","interface_name","wireless_status",
-                "tx_power","rx_power","signal_strength","peer_tx_signal","tx_rate","rx_rate","ccq","tx_ccq","rx_ccq",
-                "snr","noise_floor","temperature","cpu_load","memory_usage","uptime"
-            )
-            for f in preserve_fields:
-                incoming=str(data.get(f,"") or "").strip()
-                oldv=old.get(f,"") or ""
-                if not incoming and oldv:
-                    c.execute(f"UPDATE devices SET {f}=? WHERE ip_address=?",(oldv,ip))
-
         for eff,man in protected.items():
             oldv=old.get(man,"") or ""
             c.execute(f"UPDATE devices SET {man}=?, {eff}=? WHERE ip_address=?",(oldv,oldv if oldv else data.get(eff,""),ip))
@@ -428,87 +411,52 @@ def list_manual_ips():
     finally:c.close()
 
 
-def _resolve_manual_city(c,ip,city_id=None):
+def add_manual_ip(ip,description="",city_id=None):
     from ipaddress import ip_address,ip_network
-    selected_city_id=int(city_id) if city_id not in (None,"") else None
-    matched=None
-    if selected_city_id is not None:
-        row=c.execute("SELECT * FROM cities WHERE id=? AND enabled=1",(selected_city_id,)).fetchone()
-        if not row:
-            raise ValueError("شهر انتخاب‌شده معتبر نیست")
-        matched=dict(row)
-    else:
-        obj=ip_address(ip)
-        for row in c.execute("SELECT * FROM cities WHERE enabled=1 ORDER BY id").fetchall():
-            try:
-                if obj in ip_network(row["cidr"],strict=False):
-                    matched=dict(row)
-                    selected_city_id=int(row["id"])
-                    break
-            except Exception:
-                continue
-    return selected_city_id,matched
-
-
-def _apply_manual_device_details(c,ip,details):
-    details=details or {}
-    allowed=(
-        "device_type","vendor","hostname","model","serial_number","mac_address",
-        "ssid","frequency","channel","bandwidth","mode","radio_name",
-        "tx_power","rx_power","signal_strength","peer_tx_signal","rx_rate","tx_rate",
-        "ccq","snr","noise_floor"
-    )
-    sets=[];args=[]
-    for field in allowed:
-        if field in details and details.get(field) not in (None,""):
-            value=str(details.get(field)).strip()
-            if value:
-                sets.append(f"{field}=?");args.append(value)
-    if sets:
-        sets.append("last_updated=?");args.append(now());args.append(ip)
-        c.execute(f"UPDATE devices SET {','.join(sets)} WHERE ip_address=?",args)
-
-
-def _upsert_manual_target(c,ip,description="",city_id=None,details=None):
-    selected_city_id,matched=_resolve_manual_city(c,ip,city_id)
-    desc=str(description or "").strip()
-    c.execute("""INSERT INTO manual_ips(ip_address,city_id,description,enabled,created_at)
-                 VALUES(?,?,?,?,?)
-                 ON CONFLICT(ip_address) DO UPDATE SET
-                   city_id=excluded.city_id,
-                   description=CASE WHEN excluded.description<>'' THEN excluded.description ELSE manual_ips.description END,
-                   enabled=1""",
-              (ip,selected_city_id,desc,1,now()))
-
-    if matched:
-        c.execute("""INSERT INTO devices(ip_address,city_id,city,scan_status,last_updated)
-                     VALUES(?,?,?,?,?)
-                     ON CONFLICT(ip_address) DO UPDATE SET
-                       city_id=excluded.city_id,
-                       city=CASE
-                              WHEN COALESCE(devices.city,'') IN ('','Manual','manual_pending') THEN excluded.city
-                              ELSE devices.city
-                            END""",
-                  (ip,matched["id"],matched["name"],"manual_pending",now()))
-    else:
-        c.execute("""INSERT INTO devices(ip_address,city_id,city,scan_status,last_updated)
-                     VALUES(?,?,?,?,?)
-                     ON CONFLICT(ip_address) DO NOTHING""",
-                  (ip,None,"Manual","manual_pending",now()))
-    _apply_manual_device_details(c,ip,details)
-
-
-def add_manual_ip(ip,description="",city_id=None,details=None):
-    from ipaddress import ip_address
-    ip=str(ip_address(ip))
-    c=connect()
+    ip=str(ip_address(ip));c=connect()
     try:
-        _upsert_manual_target(c,ip,description,city_id,details or {})
+        selected_city_id=int(city_id) if city_id not in (None,"") else None
+        matched=None
+        if selected_city_id is not None:
+            row=c.execute("SELECT * FROM cities WHERE id=? AND enabled=1",(selected_city_id,)).fetchone()
+            if not row:
+                raise ValueError("شهر انتخاب‌شده معتبر نیست")
+            matched=dict(row)
+        else:
+            for row in c.execute("SELECT * FROM cities WHERE enabled=1 ORDER BY id").fetchall():
+                try:
+                    if ip_address(ip) in ip_network(row["cidr"],strict=False):
+                        matched=dict(row)
+                        selected_city_id=int(row["id"])
+                        break
+                except Exception:
+                    continue
+
+        cur=c.execute("""INSERT INTO manual_ips(ip_address,city_id,description,enabled,created_at)
+                        VALUES(?,?,?,?,?)
+                        ON CONFLICT(ip_address) DO UPDATE SET
+                          city_id=excluded.city_id,
+                          description=excluded.description,
+                          enabled=1""",
+                       (ip,selected_city_id,description.strip(),1,now()))
+
+        if matched:
+            c.execute("""INSERT INTO devices(ip_address,city_id,city,scan_status,last_updated)
+                        VALUES(?,?,?,?,?)
+                        ON CONFLICT(ip_address) DO UPDATE SET
+                          city_id=excluded.city_id,
+                          city=CASE
+                                 WHEN COALESCE(devices.city,'') IN ('','Manual') THEN excluded.city
+                                 ELSE devices.city
+                               END""",
+                       (ip,matched["id"],matched["name"],"manual_pending",now()))
+        else:
+            c.execute("""INSERT INTO devices(ip_address,city_id,city,scan_status,last_updated)
+                        VALUES(?,?,?,?,?)
+                        ON CONFLICT(ip_address) DO NOTHING""",
+                       (ip,None,"Manual","manual_pending",now()))
         c.commit()
         return dict(c.execute("SELECT * FROM manual_ips WHERE ip_address=?",(ip,)).fetchone())
-    except Exception:
-        c.rollback()
-        raise
     finally:c.close()
 
 
@@ -522,43 +470,11 @@ def get_manual_radio(ip):
     c=connect();r=c.execute("SELECT * FROM manual_radios WHERE ip_address=?",(ip,)).fetchone();c.close();return dict(r) if r else None
 
 def upsert_manual_radio(x):
-    from ipaddress import ip_address
     fields=["ip_address","name","model","vendor","serial_number","ssid","frequency","channel","bandwidth","mode","radio_name","tx_power","rx_power","signal_strength","peer_tx_signal","tx_rate","rx_rate","ccq","snr","noise_floor","notes"]
-    vals=[str(x.get(f,"")).strip() for f in fields]
-    vals[0]=str(ip_address(vals[0]))
-    ts=now();c=connect()
+    vals=[str(x.get(f,"")).strip() for f in fields];ts=now();c=connect()
     try:
         sql=f"INSERT INTO manual_radios({','.join(fields)},created_at,updated_at) VALUES({','.join('?' for _ in fields)},?,?) ON CONFLICT(ip_address) DO UPDATE SET "+','.join(f"{f}=excluded.{f}" for f in fields if f!='ip_address')+",updated_at=excluded.updated_at"
-        c.execute(sql,vals+[ts,ts])
-
-        details={
-            "device_type":str(x.get("device_type") or x.get("vendor") or "Manual Radio").strip(),
-            "hostname":str(x.get("name") or "").strip(),
-            "model":str(x.get("model") or "").strip(),
-            "vendor":str(x.get("vendor") or "").strip(),
-            "serial_number":str(x.get("serial_number") or "").strip(),
-            "ssid":str(x.get("ssid") or "").strip(),
-            "frequency":str(x.get("frequency") or "").strip(),
-            "channel":str(x.get("channel") or "").strip(),
-            "bandwidth":str(x.get("bandwidth") or "").strip(),
-            "mode":str(x.get("mode") or "").strip(),
-            "radio_name":str(x.get("radio_name") or "").strip(),
-            "tx_power":str(x.get("tx_power") or "").strip(),
-            "rx_power":str(x.get("rx_power") or "").strip(),
-            "signal_strength":str(x.get("signal_strength") or "").strip(),
-            "peer_tx_signal":str(x.get("peer_tx_signal") or "").strip(),
-            "tx_rate":str(x.get("tx_rate") or "").strip(),
-            "rx_rate":str(x.get("rx_rate") or "").strip(),
-            "ccq":str(x.get("ccq") or "").strip(),
-            "snr":str(x.get("snr") or "").strip(),
-            "noise_floor":str(x.get("noise_floor") or "").strip()
-        }
-        _upsert_manual_target(c,vals[0],str(x.get("notes") or "").strip(),x.get("city_id"),details)
-        c.commit()
-        return dict(c.execute("SELECT * FROM manual_radios WHERE ip_address=?",(vals[0],)).fetchone())
-    except Exception:
-        c.rollback()
-        raise
+        c.execute(sql,vals+[ts,ts]);c.commit();return dict(c.execute("SELECT * FROM manual_radios WHERE ip_address=?",(vals[0],)).fetchone())
     finally:c.close()
 
 def delete_manual_radio(i):

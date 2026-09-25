@@ -209,7 +209,7 @@ def mi_get():return jsonify(db.list_manual_ips())
 @full
 def mi_add():
     x=request.get_json(silent=True) or {}
-    try:return jsonify(db.add_manual_ip(x.get("ip_address","").strip(),x.get("description","").strip(),x.get("city_id"),x.get("details") or {})),201
+    try:return jsonify(db.add_manual_ip(x.get("ip_address","").strip(),x.get("description","").strip(),x.get("city_id"))),201
     except Exception as e:return jsonify(error="invalid_ip",message=str(e)),400
 @app.delete("/api/manual-ips/<int:i>")
 @auth
